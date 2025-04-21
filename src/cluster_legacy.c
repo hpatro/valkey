@@ -4218,8 +4218,7 @@ void clusterSendPing(clusterLink *link, int type) {
      * Since we have non-voting replicas that lower the probability of an entry
      * to feature our node, we set the number of entries per packet as
      * 10% of the total nodes we have. */
-    wanted = floor(dictSize(server.cluster->nodes) / 10);
-    if (wanted < 3) wanted = 3;
+    wanted = floor((dictSize(server.cluster->nodes) * server.cluster_gossip_size_percentage) / 100);
     if (wanted > freshnodes) wanted = freshnodes;
 
     /* Include all the nodes in PFAIL state, so that failure reports are
