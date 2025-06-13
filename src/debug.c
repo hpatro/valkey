@@ -35,6 +35,7 @@
 #include "quicklist.h"
 #include "fpconv_dtoa.h"
 #include "cluster.h"
+#include "cluster_legacy.h"
 #include "threads_mngr.h"
 #include "io_threads.h"
 #include "sds.h"
@@ -440,6 +441,10 @@ void debugCommand(client *c) {
             "    When set to 1, the cluster link is closed after dropping a packet based on the filter.",
             "DISABLE-CLUSTER-RANDOM-PING <0|1>",
             "    Disable sending cluster ping to a random node every second.",
+            "CLUSTER-MSG-SET <message>",
+            "    Set debug message to include in cluster ping/pong packets (max 1KB).",
+            "CLUSTERMSGGET <node-id>",
+            "    Get the debug message last received from the specified node.",
             "OOM",
             "    Crash the server simulating an out-of-memory error.",
             "PANIC",
@@ -614,6 +619,27 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(c->argv[1]->ptr, "disable-cluster-random-ping") && c->argc == 3) {
         server.debug_cluster_disable_random_ping = atoi(c->argv[2]->ptr);
         addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "cluster-msg-set") && c->argc == 3) {
+        size_t len = sdslen(c->argv[2]->ptr);
+        if (len > CLUSTERMSG_MAX_DEBUG_MESSAGE) {
+            addReplyError(c, "Message too long (max 1KB)");
+            return;
+        }
+        sdsfree(server.cluster_bus_debug_msg);
+        server.cluster_bus_debug_msg = sdsdup(c->argv[2]->ptr);
+        clusterUpdateMyselfDebugMessage();
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "clustermsgget") && c->argc == 3) {
+        if (sdslen(c->argv[2]->ptr) != CLUSTER_NAMELEN) {
+            addReplyError(c, "Invalid node-id length");
+            return;
+        }
+        clusterNode *n = clusterLookupNode(c->argv[2]->ptr, CLUSTER_NAMELEN);
+        if (!n) {
+            addReplyError(c, "Unknown node-id");
+            return;
+        }
+        addReplyBulkCBuffer(c, n->debug_message, sdslen(n->debug_message));
     } else if (!strcasecmp(c->argv[1]->ptr, "object") && (c->argc == 3 || c->argc == 4)) {
         robj *val;
         char *strenc;
