@@ -625,8 +625,8 @@ void debugCommand(client *c) {
             addReplyError(c, "Message too long (max 1KB)");
             return;
         }
-        sdsfree(server.cluster_bus_debug_msg);
-        server.cluster_bus_debug_msg = sdsdup(c->argv[2]->ptr);
+        sdsfree(server.cluster->myself->debug_message);
+        server.cluster->myself->debug_message = sdsdup(c->argv[2]->ptr);
         clusterUpdateMyselfDebugMessage();
         addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "cluster-msg-get") && c->argc == 3) {

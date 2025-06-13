@@ -1142,7 +1142,7 @@ void clusterUpdateMyselfClientIpV6(void) {
 
 void clusterUpdateMyselfDebugMessage(void) {
     if (!myself) return;
-    updateDebugMessage(myself, server.cluster_bus_debug_msg);
+    updateDebugMessage(myself, server.cluster->myself->debug_message);
 }
 
 void clusterInit(void) {
@@ -2890,7 +2890,7 @@ static uint32_t writePingExtensions(clusterMsg *hdr, int gossipcount) {
     extensions +=
         writeSdsPingExtIfNonempty(&totlen, &cursor, CLUSTERMSG_EXT_TYPE_CLIENT_IPV6, myself->announce_client_ipv6);
     extensions +=
-        writeSdsPingExtIfNonempty(&totlen, &cursor, CLUSTERMSG_EXT_TYPE_DEBUG_MESSAGE, server.cluster_bus_debug_msg);
+        writeSdsPingExtIfNonempty(&totlen, &cursor, CLUSTERMSG_EXT_TYPE_DEBUG_MESSAGE, myself->debug_message);
 
     /* Gossip forgotten nodes */
     if (dictSize(server.cluster->nodes_black_list) > 0) {
