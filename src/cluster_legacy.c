@@ -3002,12 +3002,6 @@ void clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
     updateAnnouncedHumanNodename(sender, ext_humannodename);
     updateAnnouncedClientIpV4(sender, ext_clientipv4);
     updateAnnouncedClientIpV6(sender, ext_clientipv6);
-    if (ext_debug_message &&
-        sdscmp(sender->debug_message, ext_debug_message) != 0) {
-        sdsfree(server.cluster_bus_debug_msg);
-        server.cluster_bus_debug_msg = sdsnew(ext_debug_message);
-        clusterUpdateMyselfDebugMessage();
-    }
     updateDebugMessage(sender, ext_debug_message);
     /* If the node did not send us a shard-id extension, it means the sender
      * does not support it (old version), node->shard_id is randomly generated.
