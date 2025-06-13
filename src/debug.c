@@ -443,7 +443,7 @@ void debugCommand(client *c) {
             "    Disable sending cluster ping to a random node every second.",
             "CLUSTER-MSG-SET <message>",
             "    Set debug message to include in cluster ping/pong packets (max 1KB).",
-            "CLUSTERMSGGET <node-id>",
+            "CLUSTER-MSG-GET <node-id>",
             "    Get the debug message last received from the specified node.",
             "OOM",
             "    Crash the server simulating an out-of-memory error.",
@@ -629,7 +629,7 @@ void debugCommand(client *c) {
         server.cluster_bus_debug_msg = sdsdup(c->argv[2]->ptr);
         clusterUpdateMyselfDebugMessage();
         addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "clustermsgget") && c->argc == 3) {
+    } else if (!strcasecmp(c->argv[1]->ptr, "cluster-msg-get") && c->argc == 3) {
         if (sdslen(c->argv[2]->ptr) != CLUSTER_NAMELEN) {
             addReplyError(c, "Invalid node-id length");
             return;
