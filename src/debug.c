@@ -443,8 +443,9 @@ void debugCommand(client *c) {
             "    Disable sending cluster ping to a random node every second.",
             "CLUSTER-MSG-SET <message>",
             "    Set debug message to include in cluster ping/pong packets (max 1KB).",
-            "CLUSTER-MSG-GET <node-id>",
-            "    Get the debug message last received from the specified node.",
+            "CLUSTER-MSG-GET [<node-id>]",
+            "    Get the debug message last received from the specified node",
+            "    or a map of all nodes when no node is provided.",
             "OOM",
             "    Crash the server simulating an out-of-memory error.",
             "PANIC",
@@ -629,17 +630,30 @@ void debugCommand(client *c) {
         server.cluster->myself->debug_message = sdsdup(c->argv[2]->ptr);
         clusterUpdateMyselfDebugMessage();
         addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "cluster-msg-get") && c->argc == 3) {
-        if (sdslen(c->argv[2]->ptr) != CLUSTER_NAMELEN) {
-            addReplyError(c, "Invalid node-id length");
-            return;
+    } else if (!strcasecmp(c->argv[1]->ptr, "cluster-msg-get") &&
+               (c->argc == 2 || c->argc == 3)) {
+        if (c->argc == 3) {
+            if (sdslen(c->argv[2]->ptr) != CLUSTER_NAMELEN) {
+                addReplyError(c, "Invalid node-id length");
+                return;
+            }
+            clusterNode *n = clusterLookupNode(c->argv[2]->ptr, CLUSTER_NAMELEN);
+            if (!n) {
+                addReplyError(c, "Unknown node-id");
+                return;
+            }
+            addReplyBulkCBuffer(c, n->debug_message, sdslen(n->debug_message));
+        } else {
+            dictIterator *di = dictGetIterator(server.cluster->nodes);
+            dictEntry *de;
+            addReplyMapLen(c, dictSize(server.cluster->nodes));
+            while ((de = dictNext(di)) != NULL) {
+                clusterNode *n = dictGetVal(de);
+                addReplyBulkCString(c, n->name);
+                addReplyBulkCBuffer(c, n->debug_message, sdslen(n->debug_message));
+            }
+            dictReleaseIterator(di);
         }
-        clusterNode *n = clusterLookupNode(c->argv[2]->ptr, CLUSTER_NAMELEN);
-        if (!n) {
-            addReplyError(c, "Unknown node-id");
-            return;
-        }
-        addReplyBulkCBuffer(c, n->debug_message, sdslen(n->debug_message));
     } else if (!strcasecmp(c->argv[1]->ptr, "object") && (c->argc == 3 || c->argc == 4)) {
         robj *val;
         char *strenc;
