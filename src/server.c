@@ -1651,7 +1651,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     }
 
     /* Run the Cluster cron. */
-    if (server.cluster_enabled) {
+    if (server.cluster_enabled && !server.pause_cluster_cron) {
         run_with_period(100) clusterCron();
     }
 

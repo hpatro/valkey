@@ -5360,8 +5360,7 @@ static int clusterNodeCronHandleReconnect(clusterNode *node, mstime_t now) {
         return 1;
     }
     if (nodeInNormalState(node) && node->link != NULL && node->inbound_link == NULL &&
-        now - node->inbound_link_freed_time > getHandshakeTimeout() &&
-        now - node->meet_sent > getHandshakeTimeout()) {
+        now - node->inbound_link_freed_time > getHandshakeTimeout()) {
         /* Node has an outbound link, but no inbound link for more than the handshake timeout.
          * This probably means this node does not know us yet, whereas we know it.
          * So we send it a MEET packet to do a handshake with it and correct the inconsistent cluster view.
