@@ -111,7 +111,7 @@ proc cluster_nodes_all_know_each_other {num_nodes} {
     return 1
 }
 
-start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 4000 cluster-replica-no-failover yes}} {
+start_cluster 2 0 {tags {external:skip cluster needs:other-server} overrides {cluster-node-timeout 4000 cluster-replica-no-failover yes}} {
     set CLUSTER_PACKET_TYPE_PING 0
     set CLUSTER_PACKET_TYPE_PONG 1
     set CLUSTER_PACKET_TYPE_MEET 2
@@ -120,7 +120,7 @@ start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 
 
     test "Handshake eventually succeeds after node handshake timeout on both sides with inconsistent view of the cluster" {
         set cluster_port [find_available_port $::baseport $::portcount]
-        start_server [list overrides [list cluster-enabled yes cluster-node-timeout 4000 cluster-port $cluster_port]] {
+            start_server [format {config "minimal-cluster.conf" start-other-server 1 overrides {cluster-enabled yes cluster-node-timeout 4000 cluster-port %d}} $cluster_port] {
             # In this test we will trigger a handshake timeout on both sides of the handshake.
             # Node 1 and 2 already know each other, then we make node 1 meet node 0:
             #
@@ -201,7 +201,7 @@ start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 
     } ;# test
 } ;# stop cluster
 
-start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 4000 cluster-replica-no-failover yes}} {
+start_cluster 2 0 {tags {external:skip cluster needs:other-server} overrides {cluster-node-timeout 4000 cluster-replica-no-failover yes}} {
     set CLUSTER_PACKET_TYPE_PING 0
     set CLUSTER_PACKET_TYPE_PONG 1
     set CLUSTER_PACKET_TYPE_MEET 2
@@ -210,7 +210,7 @@ start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 
 
     test "Handshake eventually succeeds after node handshake timeout on one side with inconsistent view of the cluster" {
         set cluster_port [find_available_port $::baseport $::portcount]
-        start_server [list overrides [list cluster-enabled yes cluster-node-timeout 4000 cluster-port $cluster_port]] {
+        start_server [format {config "minimal-cluster.conf" start-other-server 1 overrides {cluster-enabled yes cluster-node-timeout 4000 cluster-port %d}} $cluster_port] {
             # In this test we will trigger a handshake timeout on one side of the handshake.
             # Node 1 and 2 already know each other, then we make node 0 meet node 1:
             #
@@ -265,6 +265,9 @@ start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 
             wait_for_condition 50 200 {
                 [cluster_nodes_all_know_each_other 3]
             } else {
+                puts [R 0 CLUSTER NODES]
+                puts [R 1 CLUSTER NODES]
+                puts [R 2 CLUSTER NODES]
                 fail "Unexpected CLUSTER NODES output, all nodes should know each other."
             }
         } ;# stop Node 0
