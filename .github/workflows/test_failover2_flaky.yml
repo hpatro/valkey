@@ -1,0 +1,56 @@
+name: test-rpm-distros-tls-module-no-tls-flaky
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  test-flaky:
+    runs-on: ubuntu-latest
+    container: quay.io/centos/centos:stream9
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Install EPEL
+        run: dnf -y install epel-release
+
+      - name: make
+        run: |
+          dnf -y install make gcc openssl-devel openssl procps-ng which /usr/bin/kill /usr/bin/awk
+          make -j BUILD_TLS=module SERVER_CFLAGS='-Werror'
+
+      - name: testprep
+        run: |
+          dnf -y install tcl tcltls
+          ./utils/gen-test-certs.sh
+
+      - name: Run test 100 times
+        run: |
+          FAILURES=0
+          SUCCESSES=0
+
+          for i in {1..100}; do
+            echo "========================================="
+            echo "Run $i of 100"
+            echo "========================================="
+            
+            if ./runtest --accurate --verbose --single tests/unit/cluster/failover2.tcl; then
+              SUCCESSES=$((SUCCESSES + 1))
+              echo "✓ Run $i: PASSED"
+            else
+              FAILURES=$((FAILURES + 1))
+              echo "✗ Run $i: FAILED"
+            fi
+          done
+
+          echo "========================================="
+          echo "SUMMARY"
+          echo "========================================="
+          echo "Total runs: 100"
+          echo "Successes: $SUCCESSES"
+          echo "Failures: $FAILURES"
+          echo "Failure rate: $((FAILURES * 100 / 100))%"
+
+          if [ $FAILURES -gt 0 ]; then
+            echo "Test is FLAKY - failed $FAILURES out of 100 runs"
+            exit 1
+          fi
