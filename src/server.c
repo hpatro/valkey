@@ -1657,6 +1657,15 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         run_with_period(1000) replicationCron();
     }
 
+    /* Check for batch timeout and flush if needed */
+    if (server.batch_repl_enabled && server.batch_entries) {
+        run_with_period(100) {
+            if (batchEntriesShouldFlush(server.batch_entries)) {
+                batchEntriesFlush(server.batch_entries);
+            }
+        }
+    }
+
     /* Run the Cluster cron. */
     if (server.cluster_enabled) {
         run_with_period(CLUSTER_CRON_PERIOD_MS) clusterCron();
@@ -2315,6 +2324,14 @@ void initServerConfig(void) {
     server.rdb_client_id = -1;
     server.loading_process_events_interval_ms = LOADING_PROCESS_EVENTS_INTERVAL_DEFAULT;
     server.loading_rio = NULL;
+
+    /* Batch replication configuration */
+    server.batch_repl_enabled = 0;             /* Disabled by default */
+    server.batch_max_operations = 100;         /* Default max operations per batch */
+    server.batch_max_payload_size = 1024 * 64; /* Default max payload size (64KB) */
+    server.batch_timeout_ms = 10;              /* Default batch timeout (10ms) */
+    server.batch_quorum_size = 1;              /* Default quorum size */
+    server.batch_ack_timeout_ms = 5000;        /* Default ACK timeout (5s) */
 
     /* Replication partial resync backlog */
     server.repl_backlog = NULL;
@@ -2980,6 +2997,11 @@ void initServer(void) {
     server.acl_info.user_auth_failures = 0;
     server.acl_info.invalid_channel_accesses = 0;
     server.acl_info.acl_access_denied_tls_cert = 0;
+
+    /* Initialize batch entries */
+    if (server.batch_repl_enabled) {
+        server.batch_entries = batchEntriesCreate(NULL);
+    }
 
     /* Create the timer callback, this is our way to process many background
      * operations incrementally, like eviction of unaccessed expired keys, etc. */
@@ -4524,6 +4546,10 @@ int processCommand(client *c) {
         c->cmd->proc != resetCommand) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
+    } else if (c->flag.ae && c->cmd->proc != aeEndCommand) {
+        /* Queue commands in AE_START/AE_END context, except AE_END itself */
+        queueAeCommand(c);
+        addReply(c, shared.queued);
     } else {
         if (preCommandExec(c) == CMD_FILTER_REJECT) {
             return C_OK;
@@ -4832,6 +4858,12 @@ int finishShutdown(void) {
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
+
+    /* Clean up batch collector if it exists */
+    if (server.batch_entries) {
+        batchEntriesFree(server.batch_entries);
+        server.batch_entries = NULL;
+    }
 
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
     return C_OK;

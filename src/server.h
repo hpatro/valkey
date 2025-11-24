@@ -123,6 +123,53 @@ struct hdr_histogram;
 #define C_ERR -1
 #define C_RETRY -2
 
+/* Unified batch replication structures */
+typedef struct batchEntry {
+    int dictid;                 /* Database ID */
+    robj **argv;                /* Command arguments */
+    int argc;                   /* Argument count */
+    size_t *argv_len;           /* Argument lengths */
+    struct serverCommand *cmd;  /* Command pointer */
+    int slot;                   /* Cluster slot */
+    client *client;             /* Client that issued the command */
+} batchEntry;
+
+/* Unified batch entries - used by both primary (sending) and replica (receiving) */
+typedef struct batchEntries {
+    /* Common fields */
+    list *operations;           /* List of batchEntry */
+    size_t count;               /* Number of operations */
+    size_t payload_size;        /* Total payload size in bytes */
+    
+    /* Raft metadata (used by both sides) */
+    long long raft_term;        /* Raft term for this batch */
+    long long raft_index;       /* Raft index for this batch */
+    long long prev_log_index;   /* Index of log entry immediately preceding new ones */
+    long long prev_log_term;    /* Term of prevLogIndex entry */
+    long long commit_index;     /* Leader's commit index */
+    
+    /* Primary-side fields (for batching decisions) */
+    mstime_t batch_start_time;  /* When batch started (0 if not primary) */
+    
+    /* Replica-side fields (for validation) */
+    int expected_count;         /* Expected operation count (0 if not replica) */
+    
+    /* Execution context */
+    client *client;             /* Associated client (NULL for primary global batch) */
+} batchEntries;
+
+typedef struct batchEntries batchCollector;
+
+/* Raft entry structures */
+typedef struct raftEntry {
+    long long index;     /* Raft log index */
+    long long term;      /* Raft term */
+    int operation_count; /* Number of operations in this entry */
+    sds payload;         /* Serialized operations payload */
+} raftEntry;
+
+#define RAFT_ENTRY_VERSION 1 /* Current Raft entry format version */
+
 /* Static server configuration */
 #define CONFIG_DEFAULT_HZ 10 /* Time interrupt calls/sec. */
 #define CONFIG_MIN_HZ 1
@@ -1179,6 +1226,7 @@ typedef struct ClientFlags {
                                               current command. */
     uint64_t durable_blocked_client: 1;    /* This is a durable blocked client that is waiting for the server to
                                             * acknowledge the write of the command that caused it to be blocked. */
+    uint64_t ae : 1;                       /* This client is in an AE_START/AE_END context for batched replication */
 } ClientFlags;
 
 typedef struct ClientPubSubData {
@@ -1304,6 +1352,7 @@ typedef struct client {
     ClientReplicationData *repl_data;     /* Required for Replication operations. lazily initialized when first needed */
     ClientModuleData *module_data;        /* Required for Module operations. lazily initialized when first needed */
     multiState *mstate;                   /* MULTI/EXEC state, lazily initialized when first needed */
+    batchEntries *batch_entries;          /* Batch entries for batched replication, lazily initialized when first needed */
     blockingState *bstate;                /* Blocking state, lazily initialized when first needed */
     slotMigrationJob *slot_migration_job; /* Pointer to the slot migration job, or NULL. */
     /* Output buffer and reply handling */
@@ -1374,6 +1423,11 @@ typedef struct client {
     list *deferred_reply;                    /* List of reply objects to be sent to the client, typically after
                                                 the client has been unblocked. */
     unsigned long long deferred_reply_bytes; /* Total bytes of objects in the blocked client pending list.*/
+
+    /* Batched Replication */
+    long long waiting_batch_index; /* Raft index client is waiting for */
+    mstime_t batch_wait_start;     /* When client started waiting */
+
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -2131,6 +2185,22 @@ struct valkeyServer {
     /* Synchronous replication. */
     list *clients_waiting_acks; /* Clients waiting in WAIT or WAITAOF. */
     int get_ack_from_replicas;  /* If true we send REPLCONF GETACK. */
+
+    /* Batched Replication */
+    int batch_repl_enabled;     /* Enable batched replication */
+    int batch_max_operations;   /* Max operations per batch */
+    int batch_max_payload_size; /* Max payload size per batch (bytes) */
+    int batch_timeout_ms;       /* Max time to wait before flushing batch (milliseconds) */
+    int batch_quorum_size;      /* Required ACKs for commit */
+    int batch_ack_timeout_ms;   /* Timeout for ACK responses (milliseconds) */
+
+    /* Raft State */
+    long long raft_current_term;  /* Current Raft term */
+    long long raft_current_index; /* Current Raft log index */
+
+    /* Batch Processing */
+    batchEntries *batch_entries; /* Active batch collector */
+
     /* Limits */
     unsigned int maxclients;                    /* Max number of simultaneous clients */
     unsigned long long maxmemory;               /* Max number of memory bytes to use */
@@ -3144,6 +3214,32 @@ sds receiveSynchronousResponse(connection *conn);
 ConnectionType *connTypeOfReplication(void);
 robj *generateSelectCommand(int dictid);
 
+/* Unified batch entries functions */
+batchEntries *batchEntriesCreate(client *c);
+void batchEntriesFree(batchEntries *be);
+void batchEntriesReset(batchEntries *be);
+int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc, 
+                         size_t *argv_len, struct serverCommand *cmd, int slot, client *c);
+int batchEntriesShouldFlush(batchEntries *be);
+size_t batchEntriesMemOverhead(batchEntries *be);
+
+/* Primary-side batch operations */
+int batchEntriesFlush(batchEntries *be);
+
+/* Replica-side batch operations */
+int batchEntriesExecute(batchEntries *be, client *c);
+void aeStartCommand(client *c);
+void aeEndCommand(client *c);
+void queueAeCommand(client *c);
+void discardAeTransaction(client *c);
+
+/* Raft entry functions */
+raftEntry *batchEntriesToRaftEntry(batchEntries *be);
+sds serializeRaftEntry(raftEntry *entry);
+int parseRaftEntry(char *data, size_t len, raftEntry *entry);
+void freeRaftEntry(raftEntry *entry);
+uint32_t calculateRaftEntryChecksum(const char *data, size_t len);
+
 /* Generic persistence functions */
 void startLoadingFile(size_t size, char *filename, int rdbflags);
 void startLoading(size_t size, int rdbflags, int async);
@@ -3928,6 +4024,8 @@ void zrandmemberCommand(client *c);
 void multiCommand(client *c);
 void execCommand(client *c);
 void discardCommand(client *c);
+void aeStartCommand(client *c);
+void aeEndCommand(client *c);
 void blpopCommand(client *c);
 void brpopCommand(client *c);
 void blmpopCommand(client *c);

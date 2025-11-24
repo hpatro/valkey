@@ -559,6 +559,25 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc) {
     /* We can't have replicas attached and no backlog. */
     serverAssert(!(listLength(server.replicas) != 0 && server.repl_backlog == NULL));
 
+    /* If batched replication is enabled, add operation to batch collector */
+    if (server.batch_repl_enabled && server.batch_entries) {
+        /* Add operation to the batch collector 
+         * Note: We pass dictid=-1 to avoid adding SELECT commands to the batch.
+         * Database selection is handled separately via the normal replication stream. */
+        if (batchEntriesAddEntry(server.batch_entries, -1, argv, argc, NULL, NULL, -1, NULL) == C_OK) {
+            /* Check if we should flush the batch based on configured limits */
+            if (batchEntriesShouldFlush(server.batch_entries)) {
+                batchEntriesFlush(server.batch_entries);
+            }
+            return;
+        } else {
+            serverLog(LL_NOTICE, "Failed adding to batch collector");
+            serverAssert(0);
+        }
+    }
+
+    /* Original immediate replication path (used when batching is disabled) */
+    
     /* Must install write handler for all replicas first before feeding
      * replication stream. */
     prepareReplicasToWrite();

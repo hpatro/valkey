@@ -5906,6 +5906,7 @@ size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage) {
      * spot problematic clients. */
     mem += c->argv_len_sum + sizeof(robj *) * c->argc;
     mem += multiStateMemOverhead(c);
+    // TODO: Add memory overhead from ae commands
 
     /* Add memory overhead of pubsub channels and patterns. Note: this is just the overhead of the robj pointers
      * to the strings themselves because they aren't stored per client. */

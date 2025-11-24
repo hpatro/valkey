@@ -1,0 +1,22 @@
+{
+    "AE_END": {
+        "summary": "Executes all commands in a Raft append entry batch.",
+        "complexity": "Depends on commands in the batch",
+        "group": "server",
+        "since": "8.1.0",
+        "arity": 1,
+        "function": "aeEndCommand",
+        "command_flags": [
+            "NOSCRIPT",
+            "LOADING",
+            "STALE",
+            "SKIP_COMMANDLOG"
+        ],
+        "acl_categories": [
+            "ADMIN"
+        ],
+        "reply_schema": {
+            "const": "OK"
+        }
+    }
+}
