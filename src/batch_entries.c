@@ -6,6 +6,8 @@
 
 #include "server.h"
 
+void batchEntriesProcessDeferred(client *c);
+
 /* Free a batch operation structure */
 static void freeBatchOperation(void *ptr) {
     batchEntry *op = ptr;
@@ -20,11 +22,10 @@ static void freeBatchOperation(void *ptr) {
 }
 
 /* Create a new batch entries */
-batchEntries *batchEntriesCreate(client *c) {
+batchEntries *batchEntriesCreate(void) {
     batchEntries *bc = zcalloc(sizeof(batchEntries));
     bc->operations = listCreate();
     listSetFreeMethod(bc->operations, freeBatchOperation);
-    bc->client = c;
     return bc;
 }
 
@@ -49,7 +50,6 @@ void batchEntriesReset(batchEntries *bc) {
     bc->raft_index = 0;
     bc->prev_log_index = 0;
     bc->prev_log_term = 0;
-    bc->commit_index = 0;
     bc->expected_count = 0;
 }
 
@@ -79,8 +79,8 @@ int batchEntriesAddEntry(batchEntries *bc, int dictid, robj **argv, int argc,
     listAddNodeTail(bc->operations, op);
 
     /* Update batch statistics */
-    if (bc->count++ == 0 && !bc->client) {
-        /* Primary-side: start timing */
+    if (bc->count++ == 0) {
+        /* Start timing for batch timeout */
         bc->batch_start_time = mstime();
     }
     bc->payload_size += op_payload_size;
@@ -219,13 +219,6 @@ void freeRaftEntry(raftEntry *entry) {
     zfree(entry);
 }
 
-/* Calculate CRC32 checksum for Raft entry payload */
-uint32_t calculateRaftEntryChecksum(const char *data, size_t len) {
-    /* Use existing CRC64 function and truncate to 32 bits for simplicity */
-    uint64_t crc = crc64(0, (unsigned char *)data, len);
-    return (uint32_t)(crc & 0xFFFFFFFF);
-}
-
 /* ================================ PRIMARY-SIDE OPERATIONS ============================== */
 
 /* Flush the batch entries (primary-side: serialize and send to replicas) */
@@ -260,10 +253,6 @@ int batchEntriesFlush(batchEntries *bc) {
     /* Send the serialized Raft entry to the replication buffer */
     feedReplicationBuffer(serialized, sdslen(serialized));
     
-    /* Log the batch flush for debugging */
-    serverLog(LL_DEBUG, "Flushed batch with %zu operations, Raft index %lld, term %lld",
-              bc->count, entry->index, entry->term);
-    
     /* Clean up */
     sdsfree(serialized);
     freeRaftEntry(entry);
@@ -296,6 +285,7 @@ static void sendBatchAck(client *c, long long raft_index, long long raft_term, i
 }
 
 /* Execute all operations in the batch entries (replica-side) */
+// TODO Remove client, we should be able to execute without it.
 int batchEntriesExecute(batchEntries *bc, client *c) {
     if (!bc || !c) {
         serverLog(LL_WARNING, "batchEntriesExecute: NULL batch entries or client");
@@ -401,13 +391,18 @@ void aeStartCommand(client *c) {
     if (getLongLongFromObjectOrReply(c, c->argv[4], &commit_index, NULL) != C_OK) return;
     if (getLongLongFromObjectOrReply(c, c->argv[5], &op_count, NULL) != C_OK) return;
 
-    if (!c->batch_entries) c->batch_entries = batchEntriesCreate(c);
+    if (!c->batch_entries) c->batch_entries = batchEntriesCreate();
     c->flag.ae = 1;
     c->batch_entries->raft_term = raft_term;
     c->batch_entries->prev_log_index = prev_log_index;
     c->batch_entries->prev_log_term = prev_log_term;
-    c->batch_entries->commit_index = commit_index;
     c->batch_entries->expected_count = (int)op_count;
+    
+    /* Update server's commit index from leader */
+    if (commit_index > server.raft_commit_index) {
+        server.raft_commit_index = commit_index;
+        serverLog(LL_DEBUG, "Updated raft_commit_index to %lld", commit_index);
+    }
 
     addReply(c, shared.ok);
 }
@@ -418,21 +413,32 @@ void aeEndCommand(client *c) {
         return;
     }
 
-    int result = batchEntriesExecute(c->batch_entries, c);
+    /* Calculate the index for this batch */
+    long long batch_index = c->batch_entries->prev_log_index + 1;
+    c->batch_entries->raft_index = batch_index;
+
+    serverLog(LL_DEBUG, "AE_END: Received batch index=%lld, term=%lld, commit_index=%lld, operations=%zu",
+              batch_index, c->batch_entries->raft_term, server.raft_commit_index, c->batch_entries->count);
     
-    batchEntriesFree(c->batch_entries);
+    /* Queue the batch for deferred execution */
+    if (!server.deferred_batches) {
+        server.deferred_batches = listCreate();
+        listSetFreeMethod(server.deferred_batches, (void (*)(void*))batchEntriesFree);
+    }
+
+    /* Add to deferred queue - transfer ownership */
+    listAddNodeTail(server.deferred_batches, c->batch_entries);
     c->batch_entries = NULL;
     c->flag.ae = 0;
 
-    if (result == C_OK) {
-        addReply(c, shared.ok);
-    } else {
-        addReplyError(c, "Batch execution failed");
-    }
+    /* Try to execute any batches that can be committed now */
+    batchEntriesProcessDeferred(c);
+
+    addReply(c, shared.ok);
 }
 
 void queueAeCommand(client *c) {
-    if (!c->batch_entries) c->batch_entries = batchEntriesCreate(c);
+    if (!c->batch_entries) c->batch_entries = batchEntriesCreate();
     
     batchEntriesAddEntry(c->batch_entries, -1, c->argv, c->argc, NULL, c->cmd, c->slot, c);
     
@@ -449,4 +455,48 @@ void discardAeTransaction(client *c) {
         c->batch_entries = NULL;
     }
     c->flag.ae = 0;
+}
+
+/* ================================ DEFERRED EXECUTION ============================== */
+
+/* Process deferred batches that can now be committed */
+void batchEntriesProcessDeferred(client *c) {
+    if (!server.deferred_batches || listLength(server.deferred_batches) == 0) {
+        return;
+    }
+
+    serverLog(LL_DEBUG, "Processing deferred batches: queue_size=%lu, commit_index=%lld",
+              listLength(server.deferred_batches), server.raft_commit_index);
+
+    listIter li;
+    listNode *ln, *next;
+    listRewind(server.deferred_batches, &li);
+
+    while ((ln = listNext(&li))) {
+        batchEntries *bc = listNodeValue(ln);
+
+        /* Check if this batch can be committed */
+        if (bc->raft_index <= server.raft_commit_index) {
+            serverLog(LL_DEBUG, "Executing deferred batch: index=%lld, term=%lld, operations=%zu",
+                      bc->raft_index, bc->raft_term, bc->count);
+
+            /* Execute the batch */
+            int result = batchEntriesExecute(bc, c);
+
+            if (result == C_OK) {
+                serverLog(LL_DEBUG, "Successfully executed batch index=%lld",
+                          bc->raft_index);
+            } else {
+                serverLog(LL_WARNING, "Failed to execute deferred batch index=%lld", bc->raft_index);
+            }
+
+            /* Remove from queue (will be freed by list free method) */
+            next = ln->next;
+            listDelNode(server.deferred_batches, ln);
+            ln = next ? next->prev : NULL; /* Adjust iterator */
+        } else {
+            serverLog(LL_DEBUG, "Batch index=%lld not yet committed (commit_index=%lld), keeping in queue",
+                      bc->raft_index, server.raft_commit_index);
+        }
+    }
 }

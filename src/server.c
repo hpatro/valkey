@@ -2332,6 +2332,11 @@ void initServerConfig(void) {
     server.batch_timeout_ms = 10;              /* Default batch timeout (10ms) */
     server.batch_quorum_size = 1;              /* Default quorum size */
     server.batch_ack_timeout_ms = 5000;        /* Default ACK timeout (5s) */
+    
+    /* Raft state initialization */
+    server.raft_current_term = 0;              /* Initial term */
+    server.raft_current_index = 0;             /* Initial index */
+    server.raft_commit_index = 0;              /* Initial commit index */
 
     /* Replication partial resync backlog */
     server.repl_backlog = NULL;
@@ -3000,8 +3005,11 @@ void initServer(void) {
 
     /* Initialize batch entries */
     if (server.batch_repl_enabled) {
-        server.batch_entries = batchEntriesCreate(NULL);
+        server.batch_entries = batchEntriesCreate();
     }
+
+    /* Initialize deferred batch queue (replica-side) */
+    server.deferred_batches = NULL;
 
     /* Create the timer callback, this is our way to process many background
      * operations incrementally, like eviction of unaccessed expired keys, etc. */
@@ -4863,6 +4871,12 @@ int finishShutdown(void) {
     if (server.batch_entries) {
         batchEntriesFree(server.batch_entries);
         server.batch_entries = NULL;
+    }
+
+    /* Clean up deferred batches queue */
+    if (server.deferred_batches) {
+        listRelease(server.deferred_batches);
+        server.deferred_batches = NULL;
     }
 
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");

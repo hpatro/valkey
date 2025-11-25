@@ -561,9 +561,7 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc) {
 
     /* If batched replication is enabled, add operation to batch collector */
     if (server.batch_repl_enabled && server.batch_entries) {
-        /* Add operation to the batch collector 
-         * Note: We pass dictid=-1 to avoid adding SELECT commands to the batch.
-         * Database selection is handled separately via the normal replication stream. */
+        /* Add operation to the batch collector */
         if (batchEntriesAddEntry(server.batch_entries, -1, argv, argc, NULL, NULL, -1, NULL) == C_OK) {
             /* Check if we should flush the batch based on configured limits */
             if (batchEntriesShouldFlush(server.batch_entries)) {
@@ -577,7 +575,7 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc) {
     }
 
     /* Original immediate replication path (used when batching is disabled) */
-    
+
     /* Must install write handler for all replicas first before feeding
      * replication stream. */
     prepareReplicasToWrite();
@@ -1440,8 +1438,8 @@ void replconfCommand(client *c) {
             if (c->repl_data->repl_state == REPLICA_STATE_BG_RDB_LOAD) {
                 replicaPutOnline(c);
             }
-            
-            // Process all clients waiting ACK from a quorum 
+
+            // Process all clients waiting ACK from a quorum
             postReplicaAck();
             /* Note: this command does not reply anything! */
             return;
@@ -1534,6 +1532,35 @@ void replconfCommand(client *c) {
 
             if (c->repl_data->replica_nodeid) sdsfree(c->repl_data->replica_nodeid);
             c->repl_data->replica_nodeid = sdsdup(c->argv[j + 1]->ptr);
+        } else if (!strcasecmp(c->argv[j]->ptr, "batch-ack")) {
+            /* REPLCONF BATCH-ACK <raft_index> <raft_term> <status>
+             * Used by replica to acknowledge successful batch application */
+            long long raft_index, raft_term;
+
+            if (j + 3 >= c->argc) {
+                addReplyError(c, "REPLCONF BATCH-ACK requires index, term, and status");
+                return;
+            }
+
+            if (getLongLongFromObjectOrReply(c, c->argv[j + 1], &raft_index, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[j + 2], &raft_term, NULL) != C_OK) return;
+
+            char *status = c->argv[j + 3]->ptr;
+
+            if (!strcasecmp(status, "ok")) {
+                serverLog(LL_DEBUG, "Processed successful BATCH-ACK from replica %s for index=%lld, term=%lld",
+                          replicationGetReplicaName(c), raft_index, raft_term);
+
+                /* TODO: Integrate with durable_write system when ready */
+                /* durableWriteProcessAck(raft_index, raft_term, c); */
+            } else {
+                /* Log error ACK */
+                serverLog(LL_WARNING, "Received error BATCH-ACK from replica %s for index=%lld: %s",
+                          replicationGetReplicaName(c), raft_index, status);
+            }
+
+            /* Note: this command does not reply anything! */
+            return;
         } else {
             addReplyErrorFormat(c, "Unrecognized REPLCONF option: %s", (char *)c->argv[j]->ptr);
             return;

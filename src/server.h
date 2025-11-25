@@ -146,16 +146,12 @@ typedef struct batchEntries {
     long long raft_index;       /* Raft index for this batch */
     long long prev_log_index;   /* Index of log entry immediately preceding new ones */
     long long prev_log_term;    /* Term of prevLogIndex entry */
-    long long commit_index;     /* Leader's commit index */
     
     /* Primary-side fields (for batching decisions) */
     mstime_t batch_start_time;  /* When batch started (0 if not primary) */
     
     /* Replica-side fields (for validation) */
     int expected_count;         /* Expected operation count (0 if not replica) */
-    
-    /* Execution context */
-    client *client;             /* Associated client (NULL for primary global batch) */
 } batchEntries;
 
 typedef struct batchEntries batchCollector;
@@ -2195,11 +2191,13 @@ struct valkeyServer {
     int batch_ack_timeout_ms;   /* Timeout for ACK responses (milliseconds) */
 
     /* Raft State */
-    long long raft_current_term;  /* Current Raft term */
-    long long raft_current_index; /* Current Raft log index */
+    long long raft_current_term;   /* Current Raft term */
+    long long raft_current_index;  /* Current Raft log index */
+    long long raft_commit_index;   /* Committed Raft index (updated from leader) */
 
     /* Batch Processing */
-    batchEntries *batch_entries; /* Active batch collector */
+    batchEntries *batch_entries;   /* Active batch collector */
+    list *deferred_batches;        /* Queue of batches waiting for commit (replica-side) */
 
     /* Limits */
     unsigned int maxclients;                    /* Max number of simultaneous clients */
@@ -3215,7 +3213,7 @@ ConnectionType *connTypeOfReplication(void);
 robj *generateSelectCommand(int dictid);
 
 /* Unified batch entries functions */
-batchEntries *batchEntriesCreate(client *c);
+batchEntries *batchEntriesCreate(void);
 void batchEntriesFree(batchEntries *be);
 void batchEntriesReset(batchEntries *be);
 int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc, 
