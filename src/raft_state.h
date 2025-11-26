@@ -94,6 +94,19 @@ int raftStateIsHeartbeatTimeout(void);
 /* Quorum calculation */
 int raftStateCalculateQuorum(int num_nodes);
 int raftStateHasQuorum(long long index, int num_nodes);
+
+/**
+ * Calculate the quorum index based on current match indices.
+ *
+ * The quorum index is the highest log index that has been replicated
+ * to a quorum of nodes (including the primary). This is calculated by:
+ * 1. Collecting all match indices from replicas
+ * 2. Including the primary's last_log_index
+ * 3. Sorting in descending order
+ * 4. Selecting the Nth highest where N equals the quorum size
+ *
+ * @return The quorum index, or 0 if Raft state is not initialized
+ */
 long long raftStateGetQuorumIndex(void);
 
 /* State validation */

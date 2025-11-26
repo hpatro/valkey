@@ -362,6 +362,7 @@ long long raftStateGetQuorumIndex(void) {
 
     /* Handle edge case: no replicas, return primary's index */
     if (num_replicas == 0) {
+        serverLog(LL_DEBUG, "Raft: No replicas, quorum index equals last_log_index %lld", rs->last_log_index);
         return rs->last_log_index;
     }
 
@@ -376,6 +377,8 @@ long long raftStateGetQuorumIndex(void) {
         for (int i = 0; i < num_replicas; i++) {
             indices[i] = rs->match_index[i];
         }
+    } else {
+        serverLog(LL_WARNING, "Raft: match_index array is NULL, treating all replicas as index 0");
     }
 
     /* Add primary's index */
@@ -388,9 +391,12 @@ long long raftStateGetQuorumIndex(void) {
     int quorum_size = raftStateCalculateQuorum(total_nodes);
     long long quorum_index = indices[quorum_size - 1];
 
+    serverLog(LL_DEBUG, "Raft: Calculated quorum index %lld (nodes: %d, quorum: %d, last_log: %lld)",
+              quorum_index, total_nodes, quorum_size, rs->last_log_index);
+
     /* Validate: quorum index should not exceed primary's index */
     if (quorum_index > rs->last_log_index) {
-        serverLog(LL_WARNING, "Raft: Quorum index %lld exceeds last_log_index %lld",
+        serverLog(LL_WARNING, "Raft: Quorum index %lld exceeds last_log_index %lld, capping to last_log_index",
                   quorum_index, rs->last_log_index);
         quorum_index = rs->last_log_index;
     }
@@ -398,6 +404,49 @@ long long raftStateGetQuorumIndex(void) {
     zfree(indices);
 
     return quorum_index;
+}
+
+/**
+ * Update the quorum index and commit index based on current match indices.
+ *
+ * This function should be called after any match index update to determine
+ * if the commit index can advance. The commit index will only advance if
+ * the new quorum index is higher than the current commit index.
+ *
+ * @return 1 if commit index advanced, 0 otherwise
+ */
+__attribute__((unused))
+static int raftStateUpdateQuorumIndex(void) {
+    raftState *rs = server.raft;
+    if (!rs) return 0;
+
+    long long old_commit = rs->commit_index;
+    long long new_quorum = raftStateGetQuorumIndex();
+
+    if (new_quorum > old_commit) {
+        raftStateSetCommitIndex(new_quorum);
+        serverLog(LL_DEBUG, "Raft: Quorum index advanced from %lld to %lld",
+                  old_commit, new_quorum);
+        return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * Check if a specific log index has achieved quorum.
+ *
+ * This helper function determines whether a given log index has been
+ * replicated to a quorum of nodes by comparing it against the current
+ * quorum index.
+ *
+ * @param index The log index to check
+ * @return 1 if index has achieved quorum, 0 otherwise
+ */
+__attribute__((unused))
+static int raftStateHasQuorumForIndex(long long index) {
+    long long quorum_index = raftStateGetQuorumIndex();
+    return index <= quorum_index;
 }
 
 /* ================================ State Validation ============================== */
@@ -438,11 +487,14 @@ void raftStatePrint(void) {
         return;
     }
 
+    long long quorum_index = raftStateGetQuorumIndex();
+
     serverLog(LL_NOTICE, "Raft State:");
     serverLog(LL_NOTICE, "  Role: %s", raftStateRoleString(rs->role));
     serverLog(LL_NOTICE, "  Term: %lld", rs->current_term);
     serverLog(LL_NOTICE, "  Voted for: %lld", rs->voted_for);
     serverLog(LL_NOTICE, "  Commit index: %lld", rs->commit_index);
+    serverLog(LL_NOTICE, "  Quorum index: %lld", quorum_index);
     serverLog(LL_NOTICE, "  Last applied: %lld", rs->last_applied);
     serverLog(LL_NOTICE, "  Last log index: %lld", rs->last_log_index);
     serverLog(LL_NOTICE, "  Last log term: %lld", rs->last_log_term);
