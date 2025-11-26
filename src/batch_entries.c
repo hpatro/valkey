@@ -414,8 +414,12 @@ void aeEndCommand(client *c) {
     long long batch_index = c->batch_entries->prev_log_index + 1;
     c->batch_entries->raft_index = batch_index;
 
-    serverLog(LL_DEBUG, "AE_END: Received batch index=%lld, term=%lld, commit_index=%lld, operations=%zu",
-              batch_index, c->batch_entries->raft_term, raftStateGetCommitIndex(), c->batch_entries->count);
+    /* Increment the log index in Raft state (in-memory logging) */
+    long long new_log_index = raftStateIncrementLogIndex();
+    raftStateUpdateLastLog(new_log_index, c->batch_entries->raft_term);
+    
+    serverLog(LL_DEBUG, "AE_END: Received batch index=%lld, term=%lld, commit_index=%lld, operations=%zu, log_index=%lld",
+              batch_index, c->batch_entries->raft_term, raftStateGetCommitIndex(), c->batch_entries->count, new_log_index);
     
     /* Queue the batch for deferred execution */
     if (!server.deferred_batches) {
