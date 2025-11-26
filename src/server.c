@@ -2333,11 +2333,6 @@ void initServerConfig(void) {
     server.batch_quorum_size = 1;              /* Default quorum size */
     server.batch_ack_timeout_ms = 5000;        /* Default ACK timeout (5s) */
     
-    /* Raft state initialization */
-    server.raft_current_term = 0;              /* Initial term */
-    server.raft_current_index = 0;             /* Initial index */
-    server.raft_commit_index = 0;              /* Initial commit index */
-
     /* Replication partial resync backlog */
     server.repl_backlog = NULL;
     server.repl_no_replicas_since = time(NULL);

@@ -123,6 +123,9 @@ struct hdr_histogram;
 #define C_ERR -1
 #define C_RETRY -2
 
+/* Forward declarations */
+typedef struct raftState raftState;
+
 /* Unified batch replication structures */
 typedef struct batchEntry {
     int dictid;                 /* Database ID */
@@ -2191,10 +2194,8 @@ struct valkeyServer {
     int batch_ack_timeout_ms;   /* Timeout for ACK responses (milliseconds) */
 
     /* Raft State */
-    long long raft_current_term;   /* Current Raft term */
-    long long raft_current_index;  /* Current Raft log index */
-    long long raft_commit_index;   /* Committed Raft index (updated from leader) */
-
+    struct raftState *raft;        /* Raft consensus state (new API) */
+    
     /* Batch Processing */
     batchEntries *batch_entries;   /* Active batch collector */
     list *deferred_batches;        /* Queue of batches waiting for commit (replica-side) */

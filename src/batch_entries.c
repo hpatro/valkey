@@ -5,6 +5,7 @@
  */
 
 #include "server.h"
+#include "raft_state.h"
 
 void batchEntriesProcessDeferred(client *c);
 
@@ -185,7 +186,7 @@ sds serializeRaftEntry(raftEntry *entry) {
 
     /* Format: *6\r\n$8\r\nAE_START\r\n$<len>\r\n<term>\r\n$<len>\r\n<prev_log_index>\r\n$<len>\r\n<prev_log_term>\r\n$<len>\r\n<commit_index>\r\n$<len>\r\n<count>\r\n<payload>*1\r\n$6\r\nAE_END\r\n */
     sds term_str = sdsfromlonglong(entry->term);
-    sds prev_index_str = sdsfromlonglong(entry->index - 1);  /* prev_log_index is index - 1 */
+    sds prev_index_str = sdsfromlonglong(entry->index - 1);  /* TODO: Retrieve the previous log index */
     sds prev_term_str = sdsfromlonglong(entry->term);  /* Simplified: use same term */
     sds commit_str = sdsfromlonglong(entry->index);  /* commit_index is current index */
     sds count_str = sdsfromlonglong(entry->operation_count);
@@ -226,9 +227,8 @@ int batchEntriesFlush(batchEntries *bc) {
     if (!bc || bc->count == 0) return C_ERR;
     
     /* Increment Raft index for this batch */
-    server.raft_current_index++;
-    bc->raft_index = server.raft_current_index;
-    bc->raft_term = server.raft_current_term;
+    bc->raft_index = raftStateIncrementLogIndex();
+    bc->raft_term = raftStateGetCurrentTerm();
     
     /* Format the batch as a Raft entry */
     raftEntry *entry = batchEntriesToRaftEntry(bc);
@@ -399,10 +399,7 @@ void aeStartCommand(client *c) {
     c->batch_entries->expected_count = (int)op_count;
     
     /* Update server's commit index from leader */
-    if (commit_index > server.raft_commit_index) {
-        server.raft_commit_index = commit_index;
-        serverLog(LL_DEBUG, "Updated raft_commit_index to %lld", commit_index);
-    }
+    raftStateSetCommitIndex(commit_index);
 
     addReply(c, shared.ok);
 }
@@ -418,7 +415,7 @@ void aeEndCommand(client *c) {
     c->batch_entries->raft_index = batch_index;
 
     serverLog(LL_DEBUG, "AE_END: Received batch index=%lld, term=%lld, commit_index=%lld, operations=%zu",
-              batch_index, c->batch_entries->raft_term, server.raft_commit_index, c->batch_entries->count);
+              batch_index, c->batch_entries->raft_term, raftStateGetCommitIndex(), c->batch_entries->count);
     
     /* Queue the batch for deferred execution */
     if (!server.deferred_batches) {
@@ -465,8 +462,9 @@ void batchEntriesProcessDeferred(client *c) {
         return;
     }
 
+    long long commit_index = raftStateGetCommitIndex();
     serverLog(LL_DEBUG, "Processing deferred batches: queue_size=%lu, commit_index=%lld",
-              listLength(server.deferred_batches), server.raft_commit_index);
+              listLength(server.deferred_batches), commit_index);
 
     listIter li;
     listNode *ln, *next;
@@ -476,7 +474,7 @@ void batchEntriesProcessDeferred(client *c) {
         batchEntries *bc = listNodeValue(ln);
 
         /* Check if this batch can be committed */
-        if (bc->raft_index <= server.raft_commit_index) {
+        if (raftStateCanCommit(bc->raft_index)) {
             serverLog(LL_DEBUG, "Executing deferred batch: index=%lld, term=%lld, operations=%zu",
                       bc->raft_index, bc->raft_term, bc->count);
 
@@ -496,7 +494,7 @@ void batchEntriesProcessDeferred(client *c) {
             ln = next ? next->prev : NULL; /* Adjust iterator */
         } else {
             serverLog(LL_DEBUG, "Batch index=%lld not yet committed (commit_index=%lld), keeping in queue",
-                      bc->raft_index, server.raft_commit_index);
+                      bc->raft_index, commit_index);
         }
     }
 }
