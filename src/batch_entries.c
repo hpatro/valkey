@@ -297,7 +297,7 @@ int batchEntriesExecute(batchEntries *bc, client *c) {
         serverLog(LL_WARNING, "Batch operation count mismatch: expected %d, got %zu",
                   bc->expected_count, bc->count);
         if (c->flag.replica) {
-            sendBatchAck(c, bc->prev_log_index + 1, bc->raft_term, 0, "Operation count mismatch");
+            sendBatchAck(c, raftStateGetLastLogIndex(), raftStateGetLastLogTerm(), 0, "Operation count mismatch");
         }
         return C_ERR;
     }
@@ -367,8 +367,12 @@ int batchEntriesExecute(batchEntries *bc, client *c) {
     c->cmd = c->realcmd = orig_cmd;
     
     /* Send ACK if this is a replica */
-    if (c->flag.replica && execution_success) {
-        sendBatchAck(c, bc->prev_log_index + 1, bc->raft_term, 1, NULL);
+    if (c->flag.replica) {
+        if (execution_success) {
+            sendBatchAck(c, raftStateGetLastLogIndex(), raftStateGetLastLogTerm(), 1, NULL);
+        } else {
+            sendBatchAck(c, raftStateGetLastLogIndex(), raftStateGetLastLogTerm(), 0, "Execution failed");
+        }
     }
     
     return execution_success ? C_OK : C_ERR;
