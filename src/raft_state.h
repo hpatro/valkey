@@ -94,6 +94,7 @@ int raftStateIsHeartbeatTimeout(void);
 /* Quorum calculation */
 int raftStateCalculateQuorum(int num_nodes);
 int raftStateHasQuorum(long long index, int num_nodes);
+long long raftStateGetQuorumIndex(void);
 
 /* State validation */
 int raftStateValidate(void);
