@@ -6452,6 +6452,37 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0));
     }
 
+    /* Raft */
+    if (all_sections || (dictFind(section_dict, "raft") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+
+        if (server.raft) {
+            raftState *rs = server.raft;
+
+            info = sdscatprintf(info,
+                                "# Raft\r\n"
+                                "raft_enabled:1\r\n"
+                                "raft_role:%s\r\n"
+                                "raft_term:%lld\r\n"
+                                "raft_voted_for:%lld\r\n"
+                                "raft_commit_index:%lld\r\n"
+                                "raft_last_applied:%lld\r\n"
+                                "raft_last_log_index:%lld\r\n"
+                                "raft_last_log_term:%lld\r\n",
+                                raftStateRoleString(rs->role),
+                                rs->current_term,
+                                rs->voted_for,
+                                rs->commit_index,
+                                rs->last_applied,
+                                rs->last_log_index,
+                                rs->last_log_term);
+        } else {
+            info = sdscatprintf(info,
+                                "# Raft\r\n"
+                                "raft_enabled:0\r\n");
+        }
+    }
+
     /* CPU */
     if (all_sections || (dictFind(section_dict, "cpu") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
