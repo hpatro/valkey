@@ -7,13 +7,10 @@
 #include "server.h"
 #include "raft_state.h"
 
-/* Global Raft state */
-static raftState *globalRaftState = NULL;
-
 /* ================================ Initialization ============================== */
 
 void raftStateInit(void) {
-    if (globalRaftState) {
+    if (server.raft) {
         serverLog(LL_WARNING, "Raft state already initialized");
         return;
     }
@@ -47,21 +44,21 @@ void raftStateInit(void) {
     rs->next_index = NULL;
     rs->match_index = NULL;
     
-    globalRaftState = rs;
+    server.raft = rs;
     serverLog(LL_NOTICE, "Raft state initialized");
 }
 
 void raftStateCleanup(void) {
-    if (!globalRaftState) return;
+    if (!server.raft) return;
     
     raftStateFreeLeaderState();
-    zfree(globalRaftState);
-    globalRaftState = NULL;
+    zfree(server.raft);
+    server.raft = NULL;
     serverLog(LL_NOTICE, "Raft state cleaned up");
 }
 
 void raftStateReset(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     rs->current_term = 0;
@@ -80,11 +77,11 @@ void raftStateReset(void) {
 /* ================================ Term Management ============================== */
 
 long long raftStateGetCurrentTerm(void) {
-    return globalRaftState ? globalRaftState->current_term : 0;
+    return server.raft ? server.raft->current_term : 0;
 }
 
 void raftStateSetCurrentTerm(long long term) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     if (term > rs->current_term) {
@@ -95,7 +92,7 @@ void raftStateSetCurrentTerm(long long term) {
 }
 
 int raftStateIncrementTerm(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return C_ERR;
     
     rs->current_term++;
@@ -107,11 +104,11 @@ int raftStateIncrementTerm(void) {
 /* ================================ Commit Index Management ============================== */
 
 long long raftStateGetCommitIndex(void) {
-    return globalRaftState ? globalRaftState->commit_index : 0;
+    return server.raft ? server.raft->commit_index : 0;
 }
 
 void raftStateSetCommitIndex(long long index) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     if (index > rs->commit_index) {
@@ -122,7 +119,7 @@ void raftStateSetCommitIndex(long long index) {
 }
 
 int raftStateCanCommit(long long index) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return 0;
     return index <= rs->commit_index;
 }
@@ -130,15 +127,15 @@ int raftStateCanCommit(long long index) {
 /* ================================ Log Index Management ============================== */
 
 long long raftStateGetLastLogIndex(void) {
-    return globalRaftState ? globalRaftState->last_log_index : 0;
+    return server.raft ? server.raft->last_log_index : 0;
 }
 
 long long raftStateGetLastLogTerm(void) {
-    return globalRaftState ? globalRaftState->last_log_term : 0;
+    return server.raft ? server.raft->last_log_term : 0;
 }
 
 void raftStateUpdateLastLog(long long index, long long term) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     rs->last_log_index = index;
@@ -146,7 +143,7 @@ void raftStateUpdateLastLog(long long index, long long term) {
 }
 
 long long raftStateIncrementLogIndex(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return 0;
     
     rs->last_log_index++;
@@ -156,11 +153,11 @@ long long raftStateIncrementLogIndex(void) {
 /* ================================ Role Management ============================== */
 
 raftRole raftStateGetRole(void) {
-    return globalRaftState ? globalRaftState->role : RAFT_ROLE_FOLLOWER;
+    return server.raft ? server.raft->role : RAFT_ROLE_FOLLOWER;
 }
 
 void raftStateSetRole(raftRole role) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     if (rs->role != role) {
@@ -190,11 +187,11 @@ const char *raftStateRoleString(raftRole role) {
 /* ================================ Voting ============================== */
 
 long long raftStateGetVotedFor(void) {
-    return globalRaftState ? globalRaftState->voted_for : -1;
+    return server.raft ? server.raft->voted_for : -1;
 }
 
 void raftStateSetVotedFor(long long candidate_id) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     rs->voted_for = candidate_id;
@@ -203,7 +200,7 @@ void raftStateSetVotedFor(long long candidate_id) {
 }
 
 int raftStateCanVoteFor(long long candidate_id, long long term) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return 0;
     
     /* Can vote if:
@@ -221,7 +218,7 @@ int raftStateCanVoteFor(long long candidate_id, long long term) {
 /* ================================ Leader State Management ============================== */
 
 void raftStateInitLeaderState(int num_followers) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     /* Free existing state if any */
@@ -243,7 +240,7 @@ void raftStateInitLeaderState(int num_followers) {
 }
 
 void raftStateFreeLeaderState(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     if (rs->next_index) {
@@ -258,25 +255,25 @@ void raftStateFreeLeaderState(void) {
 }
 
 long long raftStateGetNextIndex(int follower_idx) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs || !rs->next_index) return 0;
     return rs->next_index[follower_idx];
 }
 
 void raftStateSetNextIndex(int follower_idx, long long index) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs || !rs->next_index) return;
     rs->next_index[follower_idx] = index;
 }
 
 long long raftStateGetMatchIndex(int follower_idx) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs || !rs->match_index) return 0;
     return rs->match_index[follower_idx];
 }
 
 void raftStateSetMatchIndex(int follower_idx, long long index) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs || !rs->match_index) return;
     rs->match_index[follower_idx] = index;
 }
@@ -284,7 +281,7 @@ void raftStateSetMatchIndex(int follower_idx, long long index) {
 /* ================================ Timeout Management ============================== */
 
 void raftStateResetElectionTimeout(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     /* Add randomization to prevent split votes */
@@ -293,20 +290,20 @@ void raftStateResetElectionTimeout(void) {
 }
 
 void raftStateResetHeartbeatTimeout(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return;
     
     rs->heartbeat_timeout = mstime() + rs->heartbeat_interval_ms;
 }
 
 int raftStateIsElectionTimeout(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return 0;
     return mstime() >= rs->election_timeout;
 }
 
 int raftStateIsHeartbeatTimeout(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return 0;
     return mstime() >= rs->heartbeat_timeout;
 }
@@ -318,7 +315,7 @@ int raftStateCalculateQuorum(int num_nodes) {
 }
 
 int raftStateHasQuorum(long long index, int num_nodes) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs || !rs->match_index) return 0;
     
     int count = 1;  /* Count self */
@@ -337,7 +334,7 @@ int raftStateHasQuorum(long long index, int num_nodes) {
 /* ================================ State Validation ============================== */
 
 int raftStateValidate(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return C_ERR;
     
     /* Validate term is non-negative */
@@ -366,7 +363,7 @@ int raftStateValidate(void) {
 /* ================================ Debug and Logging ============================== */
 
 void raftStatePrint(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) {
         serverLog(LL_NOTICE, "Raft state: NULL");
         return;
@@ -383,7 +380,7 @@ void raftStatePrint(void) {
 }
 
 sds raftStateToString(void) {
-    raftState *rs = globalRaftState;
+    raftState *rs = server.raft;
     if (!rs) return sdsnew("NULL");
     
     return sdscatprintf(sdsempty(),

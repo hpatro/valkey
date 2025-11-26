@@ -34,6 +34,7 @@
 #include "server.h"
 #include "connection.h"
 #include "durable_write.h"
+#include "raft_state.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -2998,6 +2999,9 @@ void initServer(void) {
     server.acl_info.invalid_channel_accesses = 0;
     server.acl_info.acl_access_denied_tls_cert = 0;
 
+    /* Initialize Raft state */
+    raftStateInit();
+
     /* Initialize batch entries */
     if (server.batch_repl_enabled) {
         server.batch_entries = batchEntriesCreate();
@@ -4861,6 +4865,9 @@ int finishShutdown(void) {
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
+
+    /* Clean up Raft state */
+    raftStateCleanup();
 
     /* Clean up batch collector if it exists */
     if (server.batch_entries) {
