@@ -1658,14 +1658,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         run_with_period(1000) replicationCron();
     }
 
-    /* Check for batch timeout and flush if needed */
-    if (server.batch_repl_enabled && server.batch_entries) {
-        run_with_period(100) {
-            if (batchEntriesShouldFlush(server.batch_entries)) {
-                batchEntriesFlush(server.batch_entries);
-            }
-        }
-    }
+    /* Primary-side batching has been removed */
 
     /* Run the Cluster cron. */
     if (server.cluster_enabled) {
@@ -3002,10 +2995,7 @@ void initServer(void) {
     /* Initialize Raft state */
     raftStateInit();
 
-    /* Initialize batch entries */
-    if (server.batch_repl_enabled) {
-        server.batch_entries = batchEntriesCreate();
-    }
+    /* Primary-side batch entries initialization removed */
 
     /* Initialize deferred batch queue (replica-side) */
     server.deferred_batches = NULL;
@@ -4553,10 +4543,9 @@ int processCommand(client *c) {
         c->cmd->proc != resetCommand) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
-    } else if (c->flag.ae && c->cmd->proc != aeEndCommand) {
-        /* Queue commands in AE_START/AE_END context, except AE_END itself */
+    } else if (c->flag.replica) {
+        /* Queue all commands on replica side, except AE_START/AE_END themselves */
         queueAeCommand(c);
-        addReply(c, shared.queued);
     } else {
         if (preCommandExec(c) == CMD_FILTER_REJECT) {
             return C_OK;
@@ -4869,11 +4858,7 @@ int finishShutdown(void) {
     /* Clean up Raft state */
     raftStateCleanup();
 
-    /* Clean up batch collector if it exists */
-    if (server.batch_entries) {
-        batchEntriesFree(server.batch_entries);
-        server.batch_entries = NULL;
-    }
+    /* Primary-side batch collector cleanup removed */
 
     /* Clean up deferred batches queue */
     if (server.deferred_batches) {

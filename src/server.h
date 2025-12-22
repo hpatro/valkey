@@ -142,16 +142,12 @@ typedef struct batchEntries {
     /* Common fields */
     list *operations;           /* List of batchEntry */
     size_t count;               /* Number of operations */
-    size_t payload_size;        /* Total payload size in bytes */
     
-    /* Raft metadata (used by both sides) */
+    /* Raft metadata (used by replica side) */
     long long raft_term;        /* Raft term for this batch */
     long long raft_index;       /* Raft index for this batch */
     long long prev_log_index;   /* Index of log entry immediately preceding new ones */
     long long prev_log_term;    /* Term of prevLogIndex entry */
-    
-    /* Primary-side fields (for batching decisions) */
-    mstime_t batch_start_time;  /* When batch started (0 if not primary) */
     
     /* Replica-side fields (for validation) */
     int expected_count;         /* Expected operation count (0 if not replica) */
@@ -2197,7 +2193,6 @@ struct valkeyServer {
     struct raftState *raft;        /* Raft consensus state (new API) */
     
     /* Batch Processing */
-    batchEntries *batch_entries;   /* Active batch collector */
     list *deferred_batches;        /* Queue of batches waiting for commit (replica-side) */
 
     /* Limits */
@@ -3222,22 +3217,10 @@ int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc,
 int batchEntriesShouldFlush(batchEntries *be);
 size_t batchEntriesMemOverhead(batchEntries *be);
 
-/* Primary-side batch operations */
-int batchEntriesFlush(batchEntries *be);
-
 /* Replica-side batch operations */
 int batchEntriesExecute(batchEntries *be, client *c);
-void aeStartCommand(client *c);
-void aeEndCommand(client *c);
 void queueAeCommand(client *c);
 void discardAeTransaction(client *c);
-
-/* Raft entry functions */
-raftEntry *batchEntriesToRaftEntry(batchEntries *be);
-sds serializeRaftEntry(raftEntry *entry);
-int parseRaftEntry(char *data, size_t len, raftEntry *entry);
-void freeRaftEntry(raftEntry *entry);
-uint32_t calculateRaftEntryChecksum(const char *data, size_t len);
 
 /* Generic persistence functions */
 void startLoadingFile(size_t size, char *filename, int rdbflags);
@@ -4023,8 +4006,6 @@ void zrandmemberCommand(client *c);
 void multiCommand(client *c);
 void execCommand(client *c);
 void discardCommand(client *c);
-void aeStartCommand(client *c);
-void aeEndCommand(client *c);
 void blpopCommand(client *c);
 void brpopCommand(client *c);
 void blmpopCommand(client *c);

@@ -45,8 +45,6 @@ void batchEntriesReset(batchEntries *bc) {
     
     listEmpty(bc->operations);
     bc->count = 0;
-    bc->payload_size = 0;
-    bc->batch_start_time = 0;
     bc->raft_term = 0;
     bc->raft_index = 0;
     bc->prev_log_index = 0;
@@ -68,50 +66,19 @@ int batchEntriesAddEntry(batchEntries *bc, int dictid, robj **argv, int argc,
     op->argv = zmalloc(sizeof(robj *) * argc);
     op->argv_len = argv_len ? zmalloc(sizeof(size_t) * argc) : NULL;
 
-    /* Copy arguments and calculate payload size */
-    size_t op_payload_size = 0;
+    /* Copy arguments */
     for (int i = 0; i < argc; i++) {
         op->argv[i] = argv[i];
         incrRefCount(argv[i]);
         if (argv_len) op->argv_len[i] = argv_len[i];
-        op_payload_size += sdslen(argv[i]->ptr);
     }
 
     listAddNodeTail(bc->operations, op);
 
-    /* Update batch statistics */
-    if (bc->count++ == 0) {
-        /* Start timing for batch timeout */
-        bc->batch_start_time = mstime();
-    }
-    bc->payload_size += op_payload_size;
+    /* Update batch count */
+    bc->count++;
 
     return C_OK;
-}
-
-/* Check if batch should be flushed (primary-side) */
-int batchEntriesShouldFlush(batchEntries *bc) {
-    if (!bc || bc->count == 0) return 0;
-    
-    /* Check batch size limit */
-    if (server.batch_max_operations > 0 && bc->count >= (size_t)server.batch_max_operations) {
-        return 1;
-    }
-    
-    /* Check payload size limit */
-    if (server.batch_max_payload_size > 0 && bc->payload_size >= (size_t)server.batch_max_payload_size) {
-        return 1;
-    }
-    
-    /* Check timeout limit */
-    if (server.batch_timeout_ms > 0 && bc->batch_start_time > 0) {
-        mstime_t elapsed = mstime() - bc->batch_start_time;
-        if (elapsed >= server.batch_timeout_ms) {
-            return 1;
-        }
-    }
-    
-    return 0;
 }
 
 /* Calculate memory overhead of batch entries */
@@ -134,133 +101,6 @@ size_t batchEntriesMemOverhead(batchEntries *bc) {
     }
     
     return mem;
-}
-
-/* ================================ RAFT ENTRY CONVERSION ============================== */
-
-/* Format a batch entries into a Raft entry */
-raftEntry *batchEntriesToRaftEntry(batchEntries *bc) {
-    if (!bc || bc->count == 0) return NULL;
-    
-    raftEntry *entry = zmalloc(sizeof(raftEntry));
-    if (!entry) return NULL;
-    
-    entry->index = bc->raft_index;
-    entry->term = bc->raft_term;
-    entry->operation_count = bc->count;
-    entry->payload = sdsempty();
-    
-    /* Track current database to minimize SELECT commands */
-    int current_dictid = -1;
-    
-    /* Serialize each operation in the batch */
-    listIter li;
-    listNode *ln;
-    listRewind(bc->operations, &li);
-    
-    while ((ln = listNext(&li))) {
-        batchEntry *op = listNodeValue(ln);
-        
-        /* Add database selection only when database changes */
-        if (op->dictid != -1 && op->dictid != current_dictid) {
-            sds dictid_str = sdsfromlonglong(op->dictid);
-            entry->payload = sdscatprintf(entry->payload, "*2\r\n$6\r\nSELECT\r\n$%zu\r\n%s\r\n", 
-                                        sdslen(dictid_str), dictid_str);
-            sdsfree(dictid_str);
-            current_dictid = op->dictid;
-        }
-        
-        /* Add the command in RESP format */
-        entry->payload = sdscatprintf(entry->payload, "*%d\r\n", op->argc);
-        for (int i = 0; i < op->argc; i++) {
-            sds arg = op->argv[i]->ptr;
-            entry->payload = sdscatprintf(entry->payload, "$%zu\r\n%s\r\n", sdslen(arg), arg);
-        }
-    }
-    return entry;
-}
-
-/* Serialize a Raft entry into the AE START/END format using RESP */
-sds serializeRaftEntry(raftEntry *entry) {
-    if (!entry) return NULL;
-
-    /* Format: *6\r\n$8\r\nAE_START\r\n$<len>\r\n<term>\r\n$<len>\r\n<prev_log_index>\r\n$<len>\r\n<prev_log_term>\r\n$<len>\r\n<commit_index>\r\n$<len>\r\n<count>\r\n<payload>*1\r\n$6\r\nAE_END\r\n */
-    sds term_str = sdsfromlonglong(entry->term);
-    sds prev_index_str = sdsfromlonglong(entry->index - 1);  /* TODO: Retrieve the previous log index */
-    sds prev_term_str = sdsfromlonglong(entry->term);  /* Simplified: use same term */
-    sds commit_str = sdsfromlonglong(entry->index);  /* commit_index is current index */
-    sds count_str = sdsfromlonglong(entry->operation_count);
-
-    sds serialized = sdscatprintf(sdsempty(),
-                                  "*6\r\n$8\r\nAE_START\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n$%zu\r\n%s\r\n",
-                                  sdslen(term_str), term_str,
-                                  sdslen(prev_index_str), prev_index_str,
-                                  sdslen(prev_term_str), prev_term_str,
-                                  sdslen(commit_str), commit_str,
-                                  sdslen(count_str), count_str);
-
-    sdsfree(term_str);
-    sdsfree(prev_index_str);
-    sdsfree(prev_term_str);
-    sdsfree(commit_str);
-    sdsfree(count_str);
-
-    serialized = sdscatsds(serialized, entry->payload);
-    serialized = sdscat(serialized, "*1\r\n$6\r\nAE_END\r\n");
-
-    return serialized;
-}
-
-/* Free a Raft entry and its resources */
-void freeRaftEntry(raftEntry *entry) {
-    if (!entry) return;
-    if (entry->payload) {
-        sdsfree(entry->payload);
-    }
-    zfree(entry);
-}
-
-/* ================================ PRIMARY-SIDE OPERATIONS ============================== */
-
-/* Flush the batch entries (primary-side: serialize and send to replicas) */
-int batchEntriesFlush(batchEntries *bc) {
-    if (!bc || bc->count == 0) return C_ERR;
-    
-    /* Increment Raft index for this batch */
-    bc->raft_index = raftStateIncrementLogIndex();
-    bc->raft_term = raftStateGetCurrentTerm();
-    
-    /* Format the batch as a Raft entry */
-    raftEntry *entry = batchEntriesToRaftEntry(bc);
-    if (!entry) {
-        serverLog(LL_WARNING, "Failed to format Raft entry for batch");
-        batchEntriesReset(bc);
-        return C_ERR;
-    }
-    
-    /* Serialize the Raft entry */
-    sds serialized = serializeRaftEntry(entry);
-    if (!serialized) {
-        serverLog(LL_WARNING, "Failed to serialize Raft entry for batch");
-        freeRaftEntry(entry);
-        batchEntriesReset(bc);
-        return C_ERR;
-    }
-    
-    /* Must install write handler for all replicas first before feeding replication stream */
-    prepareReplicasToWrite();
-    
-    /* Send the serialized Raft entry to the replication buffer */
-    feedReplicationBuffer(serialized, sdslen(serialized));
-    
-    /* Clean up */
-    sdsfree(serialized);
-    freeRaftEntry(entry);
-    
-    /* Reset the batch entries for the next batch */
-    batchEntriesReset(bc);
-    
-    return C_OK;
 }
 
 /* ================================ REPLICA-SIDE OPERATIONS ============================== */
@@ -378,74 +218,11 @@ int batchEntriesExecute(batchEntries *bc, client *c) {
     return execution_success ? C_OK : C_ERR;
 }
 
-/* ================================ AE COMMAND HANDLERS ============================== */
-
-void aeStartCommand(client *c) {
-    long long raft_term, prev_log_index, prev_log_term, commit_index, op_count;
-
-    /* Parse arguments: AE_START <raft_term> <prev_log_index> <prev_log_term> <commit_index> <op_count> */
-    if (c->argc != 6) {
-        addReplyErrorArity(c);
-        return;
-    }
-
-    if (getLongLongFromObjectOrReply(c, c->argv[1], &raft_term, NULL) != C_OK) return;
-    if (getLongLongFromObjectOrReply(c, c->argv[2], &prev_log_index, NULL) != C_OK) return;
-    if (getLongLongFromObjectOrReply(c, c->argv[3], &prev_log_term, NULL) != C_OK) return;
-    if (getLongLongFromObjectOrReply(c, c->argv[4], &commit_index, NULL) != C_OK) return;
-    if (getLongLongFromObjectOrReply(c, c->argv[5], &op_count, NULL) != C_OK) return;
-
-    if (!c->batch_entries) c->batch_entries = batchEntriesCreate();
-    c->flag.ae = 1;
-    c->batch_entries->raft_term = raft_term;
-    c->batch_entries->prev_log_index = prev_log_index;
-    c->batch_entries->prev_log_term = prev_log_term;
-    c->batch_entries->expected_count = (int)op_count;
-    
-    /* Update server's commit index from leader */
-    raftStateSetCommitIndex(commit_index);
-
-    addReply(c, shared.ok);
-}
-
-void aeEndCommand(client *c) {
-    if (!c->flag.ae || !c->batch_entries) {
-        addReplyError(c, "AE_END without AE_START");
-        return;
-    }
-
-    /* Calculate the index for this batch */
-    long long batch_index = c->batch_entries->prev_log_index + 1;
-    c->batch_entries->raft_index = batch_index;
-
-    /* Increment the log index in Raft state (in-memory logging) */
-    long long new_log_index = raftStateIncrementLogIndex();
-    raftStateUpdateLastLog(new_log_index, c->batch_entries->raft_term);
-    
-    serverLog(LL_DEBUG, "AE_END: Received batch index=%lld, term=%lld, commit_index=%lld, operations=%zu, log_index=%lld",
-              batch_index, c->batch_entries->raft_term, raftStateGetCommitIndex(), c->batch_entries->count, new_log_index);
-    
-    /* Queue the batch for deferred execution */
-    if (!server.deferred_batches) {
-        server.deferred_batches = listCreate();
-        listSetFreeMethod(server.deferred_batches, (void (*)(void*))batchEntriesFree);
-    }
-
-    /* Add to deferred queue - transfer ownership */
-    listAddNodeTail(server.deferred_batches, c->batch_entries);
-    c->batch_entries = NULL;
-    c->flag.ae = 0;
-
-    /* Try to execute any batches that can be committed now */
-    batchEntriesProcessDeferred(c);
-
-    addReply(c, shared.ok);
-}
-
 void queueAeCommand(client *c) {
+    /* Always queue commands on replica side, regardless of AE_START marker */
     if (!c->batch_entries) c->batch_entries = batchEntriesCreate();
     
-    batchEntriesAddEntry(c->batch_entries, -1, c->argv, c->argc, NULL, c->cmd, c->slot, c);
+    batchEntriesAddEntry(c->batch_entries, c->db->id, c->argv, c->argc, NULL, c->cmd, c->slot, c);
     
     /* Reset the client's args since we copied them into the batch entries */
     c->argv = NULL;
