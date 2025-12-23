@@ -3970,7 +3970,15 @@ void call(client *c, int flags) {
 
         /* Call alsoPropagate() only if at least one of AOF / replication
          * propagation is needed. */
-        if (propagate_flags != PROPAGATE_NONE) alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
+        if (propagate_flags != PROPAGATE_NONE) {
+            /* Increment log index on primary when command will be replicated */
+            if (propagate_flags & PROPAGATE_REPL) {
+                long long new_log_index = raftStateIncrementLogIndex();
+                serverLog(LL_DEBUG, "Primary incremented log index to %lld for command: %s", 
+                          new_log_index, c->cmd->fullname);
+            }
+            alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
+        }
     }
 
     /* Restore the old replication flags, since call() can be executed
@@ -4543,8 +4551,8 @@ int processCommand(client *c) {
         c->cmd->proc != resetCommand) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
-    } else if (c->flag.replica) {
-        /* Queue all commands on replica side, except AE_START/AE_END themselves */
+    } else if (server.batch_repl_enabled && c->flag.primary && is_write_command) {
+        /* Queue all write commands on replica side */
         queueAeCommand(c);
     } else {
         if (preCommandExec(c) == CMD_FILTER_REJECT) {

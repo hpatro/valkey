@@ -58,6 +58,8 @@ void replicationDiscardCachedPrimary(void);
 void replicationResurrectCachedPrimary(connection *conn);
 void replicationResurrectProvisionalPrimary(void);
 void replicationSendAck(void);
+void sendCommitIndexToReplicas(long long commit_index);
+void batchEntriesProcessDeferred(client *c);
 int replicaPutOnline(client *replica);
 void replicaStartCommandStream(client *replica);
 int cancelReplicationHandshake(int reconnect);
@@ -649,7 +651,7 @@ void showLatestBacklog(void) {
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen) {
     /* Debugging: this is handy to see the stream sent from primary
      * to replicas. Disabled with if(0). */
-    if (0) {
+    // if (0) {
         if (!server.hide_user_data_from_log) {
             printf("%zu:", buflen);
             for (size_t j = 0; j < buflen; j++) {
@@ -657,7 +659,7 @@ void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen) {
             }
             printf("\n");
         }
-    }
+    // }
 
     /* There must be replication backlog if having attached replicas. */
     if (listLength(server.replicas)) serverAssert(server.repl_backlog != NULL);
@@ -1519,30 +1521,80 @@ void replconfCommand(client *c) {
             if (c->repl_data->replica_nodeid) sdsfree(c->repl_data->replica_nodeid);
             c->repl_data->replica_nodeid = sdsdup(c->argv[j + 1]->ptr);
         } else if (!strcasecmp(c->argv[j]->ptr, "batch-ack")) {
-            /* REPLCONF BATCH-ACK <raft_index> <raft_term> <status>
+            /* REPLCONF BATCH-ACK <log_index> <commit_index> <raft_term>
              * Used by replica to acknowledge successful batch application */
-            long long raft_index, raft_term;
+            long long log_index, commit_index, raft_term;
 
             if (j + 3 >= c->argc) {
-                addReplyError(c, "REPLCONF BATCH-ACK requires index, term, and status");
+                addReplyError(c, "REPLCONF BATCH-ACK requires log_index, commit_index, term");
                 return;
             }
 
-            if (getLongLongFromObjectOrReply(c, c->argv[j + 1], &raft_index, NULL) != C_OK) return;
-            if (getLongLongFromObjectOrReply(c, c->argv[j + 2], &raft_term, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[j + 1], &log_index, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[j + 2], &commit_index, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[j + 3], &raft_term, NULL) != C_OK) return;
 
-            char *status = c->argv[j + 3]->ptr;
-
-            if (!strcasecmp(status, "ok")) {
-                serverLog(LL_DEBUG, "Processed successful BATCH-ACK from replica %s for index=%lld, term=%lld",
-                          replicationGetReplicaName(c), raft_index, raft_term);
-
-                /* TODO: Integrate with durable_write system when ready */
-                /* durableWriteProcessAck(raft_index, raft_term, c); */
+            /* Find replica index in server.replicas list */
+            listIter li;
+            listNode *ln;
+            int replica_idx = -1;
+            int idx = 0;
+            
+            listRewind(server.replicas, &li);
+            while ((ln = listNext(&li))) {
+                client *replica = listNodeValue(ln);
+                if (replica == c) {
+                    replica_idx = idx;
+                    break;
+                }
+                idx++;
+            }
+            
+            if (replica_idx >= 0) {
+                /* Update match index with the log index from the ACK */
+                raftStateSetMatchIndex(replica_idx, log_index);
+                serverLog(LL_DEBUG, "Updated match_index[%d] = %lld for replica %s",
+                            replica_idx, log_index, replicationGetReplicaName(c));
+                
+                /* Calculate and update quorum index */
+                long long quorum_index = raftStateGetQuorumIndex();
+                if (quorum_index > raftStateGetCommitIndex()) {
+                    raftStateSetCommitIndex(quorum_index);
+                    serverLog(LL_DEBUG, "Advanced commit index to %lld based on quorum", quorum_index);
+                    
+                    /* Notify all replicas about the new commit index */
+                    sendCommitIndexToReplicas(quorum_index);
+                }
             } else {
-                /* Log error ACK */
-                serverLog(LL_WARNING, "Received error BATCH-ACK from replica %s for index=%lld: %s",
-                          replicationGetReplicaName(c), raft_index, status);
+                serverLog(LL_WARNING, "Could not find replica %s in replicas list for BATCH-ACK processing",
+                            replicationGetReplicaName(c));
+            }
+
+            /* Note: this command does not reply anything! */
+            return;
+        } else if (!strcasecmp(c->argv[j]->ptr, "commit-index")) {
+            /* REPLCONF COMMIT-INDEX <commit_index>
+             * Used by primary to notify replica of new commit index */
+            long long commit_index;
+
+            if (j + 1 >= c->argc) {
+                addReplyError(c, "REPLCONF COMMIT-INDEX requires commit index");
+                return;
+            }
+
+            if (getLongLongFromObjectOrReply(c, c->argv[j + 1], &commit_index, NULL) != C_OK) return;
+
+            serverLog(LL_DEBUG, "Received COMMIT-INDEX %lld from primary", commit_index);
+
+            /* Update our commit index */
+            if (commit_index > raftStateGetCommitIndex()) {
+                raftStateSetCommitIndex(commit_index);
+                serverLog(LL_DEBUG, "Updated commit index to %lld", commit_index);
+                
+                /* Process any deferred batches that can now be executed */
+                if (server.deferred_batches) {
+                    batchEntriesProcessDeferred(c);
+                }
             }
 
             /* Note: this command does not reply anything! */
@@ -4639,6 +4691,25 @@ void replicationSendAck(void) {
          * as this subroutine does not invoke resetClient(). */
         c->net_output_bytes_curr_cmd = 0;
     }
+}
+
+/* Send commit index notification to all replicas to signal they can execute operations */
+void sendCommitIndexToReplicas(long long commit_index) {
+    if (listLength(server.replicas) == 0) {
+        return; /* No replicas to notify */
+    }
+
+    serverLog(LL_DEBUG, "Sending commit index %lld to %lu replicas", 
+              commit_index, listLength(server.replicas));
+
+    /* Prepare the REPLCONF COMMIT-INDEX command */
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf), "*3\r\n$8\r\nREPLCONF\r\n$12\r\nCOMMIT-INDEX\r\n$%d\r\n%lld\r\n",
+                       (int)sdigits10(commit_index), commit_index);
+
+    /* Send to all replicas via replication buffer */
+    prepareReplicasToWrite();
+    feedReplicationBuffer(buf, len);
 }
 
 /* ---------------------- PRIMARY CACHING FOR PSYNC -------------------------- */

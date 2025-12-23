@@ -69,7 +69,7 @@ int isPrimaryDurabilityEnabled(void) {
  * Using 2 as default for POC. 
  */
 static inline unsigned replicaAcksForConsensus(void) {
-    return 2; 
+    return server.replicas->len; 
 }
 
 /*
@@ -858,7 +858,7 @@ static long long getSingleCommandBlockingOffsetForConsistentWrites(struct client
  * about to be executed.
  */
 void preCall(void) {
-    serverLog(LOG_DEBUG, "preCall hook entered");
+    // serverLog(LOG_DEBUG, "preCall hook entered");
     if (!isPrimaryDurabilityEnabled()) return;
 
     pre_call_replication_offset = server.primary_repl_offset;
@@ -881,7 +881,9 @@ void preCall(void) {
  */
 void postCall(struct client *c) {
     // log debug tracing
-    serverLog(LOG_DEBUG, "Call hook entered for command '%s'", c->cmd->declared_name);
+    if (c->cmd->flags & CMD_WRITE) {
+        serverLog(LOG_DEBUG, "Call hook entered for command '%s'", c->cmd->declared_name);
+    }
     if (!isPrimaryDurabilityEnabled() || (c->flag.blocked))
         return;
 
@@ -908,8 +910,10 @@ void postCall(struct client *c) {
  * in the reply COB of the client and all the connected monitors.
  */
 int preCommandExec(struct client *c) {
-    serverLog(LOG_DEBUG, "preCommandExec hook entered for command '%s'", 
-              c->cmd ? c->cmd->declared_name : "NULL");
+    if (c->cmd->flags & CMD_WRITE) {
+        serverLog(LOG_DEBUG, "preCommandExec hook entered for command '%s'", 
+                c->cmd ? c->cmd->declared_name : "NULL");
+    }
     if (!isDurabilityEnabled()) {
         serverLog(LOG_DEBUG, "preCommandExec hook: durability not enabled, allowing");
         return CMD_FILTER_ALLOW;
@@ -955,8 +959,10 @@ void postCommandExec(struct client *c) {
     if (!isPrimaryDurabilityEnabled()) {
         return;
     }
-    serverLog(LOG_DEBUG, "postCommandExec hook entered for command '%s'", 
-              c->cmd ? c->cmd->declared_name : "NULL");
+    if (c->cmd->flags & CMD_WRITE) {
+        serverLog(LOG_DEBUG, "postCommandExec hook entered for command '%s'", 
+                c->cmd ? c->cmd->declared_name : "NULL");
+    }
     // If the command is NULL or is in a MULTI/EXEC block, then we skip
     // TODO: handle multi
     if(c->cmd == NULL || c->flag.multi) {
