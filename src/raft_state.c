@@ -7,67 +7,107 @@
 #include "server.h"
 #include "raft_state.h"
 
+raftState *raft_state = NULL;
+
+/* Free a batch operation structure */
+static void freeEntry(void *ptr) {
+    raftEntry *op = ptr;
+    if (op->argv) {
+        for (int i = 0; i < op->argc; i++) {
+            decrRefCount(op->argv[i]);
+        }
+        zfree(op->argv);
+    }
+    if (op->argv_len) zfree(op->argv_len);
+    zfree(op);
+}
+
+/* Create an entry */
+raftEntry *createEntry(int dictid, robj **argv, int argc, struct serverCommand *cmd) {
+    raftEntry *op = zmalloc(sizeof(raftEntry));
+    op->dictid = dictid;
+    op->argc = argc;
+    op->cmd = cmd;
+    op->argv = zmalloc(sizeof(robj *) * argc);
+
+    /* Copy arguments */
+    for (int i = 0; i < argc; i++) {
+        op->argv[i] = argv[i];
+        incrRefCount(argv[i]);
+    }
+
+    return op;
+}
+
 /* ================================ Initialization ============================== */
 
 void raftStateInit(void) {
-    if (server.raft) {
+    if (raft_state) {
         serverLog(LL_WARNING, "Raft state already initialized");
         return;
     }
 
-    raftState *rs = zcalloc(sizeof(raftState));
+    raft_state = zcalloc(sizeof(raftState));
 
     /* Initialize persistent state */
-    rs->current_term = 0;
-    rs->voted_for = -1; /* -1 means no vote cast */
+    raft_state->current_term = 0;
+    raft_state->voted_for = -1; /* -1 means no vote cast */
 
     /* Initialize volatile state */
-    rs->commit_index = 0;
-    rs->last_applied = 0;
+    raft_state->commit_index = 0;
+    raft_state->last_applied = 0;
 
     /* Initialize log state */
-    rs->last_log_index = 0;
-    rs->last_log_term = 0;
+    raft_state->last_log_index = 0;
+    raft_state->last_log_term = 0;
 
     /* Initialize node state */
-    rs->role = RAFT_ROLE_FOLLOWER;
+    raft_state->role = RAFT_ROLE_FOLLOWER;
 
     /* Initialize configuration */
-    rs->election_timeout_ms = 1000;  /* Default 1 second */
-    rs->heartbeat_interval_ms = 100; /* Default 100ms */
+    raft_state->election_timeout_ms = 1000;  /* Default 1 second */
+    raft_state->heartbeat_interval_ms = 100; /* Default 100ms */
 
     /* Initialize timeouts */
     raftStateResetElectionTimeout();
     raftStateResetHeartbeatTimeout();
 
     /* Leader state initialized to NULL */
-    rs->next_index = NULL;
-    rs->match_index = NULL;
+    raft_state->next_index = NULL;
+    raft_state->match_index = NULL;
+    raft_state->operation_log = listCreate();
+    listSetFreeMethod(raft_state->operation_log, freeEntry);
 
-    server.raft = rs;
+    server.raft = raft_state;
     serverLog(LL_NOTICE, "Raft state initialized");
 }
 
+void raftStateAddLog(raftEntry *entry) {
+    listAddNodeHead(raft_state->operation_log, entry);
+    entry->index = raftStateIncrementLogIndex();
+    entry->term = raftStateGetCurrentTerm();
+    return;
+}
+
 void raftStateCleanup(void) {
-    if (!server.raft) return;
+    if (!raft_state) return;
 
     raftStateFreeLeaderState();
-    zfree(server.raft);
-    server.raft = NULL;
+    zfree(raft_state);
+    raft_state = NULL;
     serverLog(LL_NOTICE, "Raft state cleaned up");
 }
 
 void raftStateReset(void) {
-    raftState *rs = server.raft;
-    if (!rs) return;
+    if (!raft_state) return;
 
-    rs->current_term = 0;
-    rs->voted_for = -1;
-    rs->commit_index = 0;
-    rs->last_applied = 0;
-    rs->last_log_index = 0;
-    rs->last_log_term = 0;
-    rs->role = RAFT_ROLE_FOLLOWER;
+    raft_state->current_term = 0;
+    raft_state->voted_for = -1;
+    raft_state->commit_index = 0;
+    raft_state->last_applied = 0;
+    raft_state->last_log_index = 0;
+    raft_state->last_log_term = 0;
+    raft_state->role = RAFT_ROLE_FOLLOWER;
 
     raftStateFreeLeaderState();
     raftStateResetElectionTimeout();
@@ -77,101 +117,87 @@ void raftStateReset(void) {
 /* ================================ Term Management ============================== */
 
 long long raftStateGetCurrentTerm(void) {
-    return server.raft ? server.raft->current_term : 0;
+    return raft_state ? raft_state->current_term : 0;
 }
 
 void raftStateSetCurrentTerm(long long term) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
-    if (term > rs->current_term) {
-        rs->current_term = term;
-        rs->voted_for = -1; /* Reset vote when term changes */
+    if (term > raft_state->current_term) {
+        raft_state->current_term = term;
+        raft_state->voted_for = -1; /* Reset vote when term changes */
         serverLog(LL_DEBUG, "Raft: Updated term to %lld", term);
     }
 }
 
 int raftStateIncrementTerm(void) {
-    raftState *rs = server.raft;
+    raftState *rs = raft_state;
     if (!rs) return C_ERR;
 
-    rs->current_term++;
-    rs->voted_for = -1;
-    serverLog(LL_DEBUG, "Raft: Incremented term to %lld", rs->current_term);
+    raft_state->current_term++;
+    raft_state->voted_for = -1;
+    serverLog(LL_DEBUG, "Raft: Incremented term to %lld", raft_state->current_term);
     return C_OK;
 }
 
 /* ================================ Commit Index Management ============================== */
 
 long long raftStateGetCommitIndex(void) {
-    return server.raft ? server.raft->commit_index : 0;
+    return raft_state ? raft_state->commit_index : 0;
 }
 
 void raftStateSetCommitIndex(long long index) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
-    if (index > rs->commit_index) {
+    if (index > raft_state->commit_index) {
         serverLog(LL_DEBUG, "Raft: Advancing commit index from %lld to %lld",
-                  rs->commit_index, index);
-        rs->commit_index = index;
+                  raft_state->commit_index, index);
+        raft_state->commit_index = index;
     }
 }
 
 int raftStateCanCommit(long long index) {
-    raftState *rs = server.raft;
-    if (!rs) return 0;
-    return index <= rs->commit_index;
+    return index <= raft_state->commit_index;
 }
 
 /* ================================ Log Index Management ============================== */
 
 long long raftStateGetLastLogIndex(void) {
-    return server.raft ? server.raft->last_log_index : 0;
+    return raft_state ? raft_state->last_log_index : 0;
 }
 
 long long raftStateGetLastLogTerm(void) {
-    return server.raft ? server.raft->last_log_term : 0;
+    return raft_state ? raft_state->last_log_term : 0;
+}
+
+long long raftStateGetLastApplied(void) {
+    return raft_state ? raft_state->last_applied : 0;
 }
 
 void raftStateUpdateLastLog(long long index, long long term) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
-    rs->last_log_index = index;
-    rs->last_log_term = term;
+    raft_state->last_log_index = index;
+    raft_state->last_log_term = term;
 }
 
 long long raftStateIncrementLogIndex(void) {
-    raftState *rs = server.raft;
-    if (!rs) return 0;
-
-    rs->last_log_index++;
-    return rs->last_log_index;
+    raft_state->last_log_index++;
+    return raft_state->last_log_index;
 }
 
 long long raftStateIncrementLastApplied(void) {
-    raftState *rs = server.raft;
-    rs->last_applied++;
-    return rs->last_applied;
+    raft_state->last_applied++;
+    return raft_state->last_applied;
 }
 
 
 /* ================================ Role Management ============================== */
 
 raftRole raftStateGetRole(void) {
-    return server.raft ? server.raft->role : RAFT_ROLE_FOLLOWER;
+    return raft_state ? raft_state->role : RAFT_ROLE_FOLLOWER;
 }
 
 void raftStateSetRole(raftRole role) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
-    if (rs->role != role) {
+    if (raft_state->role != role) {
         serverLog(LL_NOTICE, "Raft: Role changed from %s to %s",
-                  raftStateRoleString(rs->role),
+                  raftStateRoleString(raft_state->role),
                   raftStateRoleString(role));
-        rs->role = role;
+        raft_state->role = role;
 
         /* Reset timeouts based on new role */
         if (role == RAFT_ROLE_LEADER) {
@@ -194,52 +220,43 @@ const char *raftStateRoleString(raftRole role) {
 /* ================================ Voting ============================== */
 
 long long raftStateGetVotedFor(void) {
-    return server.raft ? server.raft->voted_for : -1;
+    return raft_state ? raft_state->voted_for : -1;
 }
 
 void raftStateSetVotedFor(long long candidate_id) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
-    rs->voted_for = candidate_id;
+    raft_state->voted_for = candidate_id;
     serverLog(LL_DEBUG, "Raft: Voted for candidate %lld in term %lld",
-              candidate_id, rs->current_term);
+              candidate_id, raft_state->current_term);
 }
 
 int raftStateCanVoteFor(long long candidate_id, long long term) {
-    raftState *rs = server.raft;
-    if (!rs) return 0;
-
     /* Can vote if:
      * 1. Haven't voted in this term, OR
      * 2. Already voted for this candidate in this term
      */
-    if (term == rs->current_term) {
-        return (rs->voted_for == -1 || rs->voted_for == candidate_id);
+    if (term == raft_state->current_term) {
+        return (raft_state->voted_for == -1 || raft_state->voted_for == candidate_id);
     }
 
     /* If term is newer, can vote */
-    return term > rs->current_term;
+    return term > raft_state->current_term;
 }
 
 /* ================================ Leader State Management ============================== */
 
 void raftStateInitLeaderState(int num_followers) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
     /* Free existing state if any */
     raftStateFreeLeaderState();
 
     if (num_followers > 0) {
-        rs->next_index = zcalloc(sizeof(long long) * num_followers);
-        rs->match_index = zcalloc(sizeof(long long) * num_followers);
+        raft_state->next_index = zcalloc(sizeof(long long) * num_followers);
+        raft_state->match_index = zcalloc(sizeof(long long) * num_followers);
 
         /* Initialize next_index to last_log_index + 1 */
         /* Initialize match_index to 0 */
         for (int i = 0; i < num_followers; i++) {
-            rs->next_index[i] = rs->last_log_index + 1;
-            rs->match_index[i] = 0;
+            raft_state->next_index[i] = raft_state->last_log_index + 1;
+            raft_state->match_index[i] = 0;
         }
 
         serverLog(LL_DEBUG, "Raft: Initialized leader state for %d followers", num_followers);
@@ -247,72 +264,55 @@ void raftStateInitLeaderState(int num_followers) {
 }
 
 void raftStateFreeLeaderState(void) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
-    if (rs->next_index) {
-        zfree(rs->next_index);
-        rs->next_index = NULL;
+    if (raft_state->next_index) {
+        zfree(raft_state->next_index);
+        raft_state->next_index = NULL;
     }
 
-    if (rs->match_index) {
-        zfree(rs->match_index);
-        rs->match_index = NULL;
+    if (raft_state->match_index) {
+        zfree(raft_state->match_index);
+        raft_state->match_index = NULL;
     }
 }
 
 long long raftStateGetNextIndex(int follower_idx) {
-    raftState *rs = server.raft;
-    if (!rs || !rs->next_index) return 0;
-    return rs->next_index[follower_idx];
+    if (!raft_state->next_index) return 0;
+    return raft_state->next_index[follower_idx];
 }
 
 void raftStateSetNextIndex(int follower_idx, long long index) {
-    raftState *rs = server.raft;
-    if (!rs || !rs->next_index) return;
-    rs->next_index[follower_idx] = index;
+    if (!raft_state->next_index) return;
+    raft_state->next_index[follower_idx] = index;
 }
 
 long long raftStateGetMatchIndex(int follower_idx) {
-    raftState *rs = server.raft;
-    if (!rs || !rs->match_index) return 0;
-    return rs->match_index[follower_idx];
+    if (!raft_state->match_index) return 0;
+    return raft_state->match_index[follower_idx];
 }
 
 void raftStateSetMatchIndex(int follower_idx, long long index) {
-    raftState *rs = server.raft;
-    if (!rs || !rs->match_index) return;
-    rs->match_index[follower_idx] = index;
+    if (!raft_state->match_index) return;
+    raft_state->match_index[follower_idx] = index;
 }
 
 /* ================================ Timeout Management ============================== */
 
 void raftStateResetElectionTimeout(void) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
     /* Add randomization to prevent split votes */
-    int jitter = rand() % (rs->election_timeout_ms / 2);
-    rs->election_timeout = mstime() + rs->election_timeout_ms + jitter;
+    int jitter = rand() % (raft_state->election_timeout_ms / 2);
+    raft_state->election_timeout = mstime() + raft_state->election_timeout_ms + jitter;
 }
 
 void raftStateResetHeartbeatTimeout(void) {
-    raftState *rs = server.raft;
-    if (!rs) return;
-
-    rs->heartbeat_timeout = mstime() + rs->heartbeat_interval_ms;
+    raft_state->heartbeat_timeout = mstime() + raft_state->heartbeat_interval_ms;
 }
 
 int raftStateIsElectionTimeout(void) {
-    raftState *rs = server.raft;
-    if (!rs) return 0;
-    return mstime() >= rs->election_timeout;
+    return mstime() >= raft_state->election_timeout;
 }
 
 int raftStateIsHeartbeatTimeout(void) {
-    raftState *rs = server.raft;
-    if (!rs) return 0;
-    return mstime() >= rs->heartbeat_timeout;
+    return mstime() >= raft_state->heartbeat_timeout;
 }
 
 /* ================================ Quorum Calculation ============================== */
@@ -322,14 +322,13 @@ int raftStateCalculateQuorum(int num_nodes) {
 }
 
 int raftStateHasQuorum(long long index, int num_nodes) {
-    raftState *rs = server.raft;
-    if (!rs || !rs->match_index) return 0;
+    if (!raft_state->match_index) return 0;
 
     int count = 1; /* Count self */
 
     /* Count how many followers have replicated this index */
     for (int i = 0; i < num_nodes - 1; i++) {
-        if (rs->match_index[i] >= index) {
+        if (raft_state->match_index[i] >= index) {
             count++;
         }
     }
@@ -360,17 +359,14 @@ static int compareIndicesDesc(const void *a, const void *b) {
  * @return The quorum index, or 0 if Raft state is not initialized
  */
 long long raftStateGetQuorumIndex(void) {
-    raftState *rs = server.raft;
-    if (!rs) return 0;
-
     /* Determine number of replicas from server.replicas list */
     int num_replicas = listLength(server.replicas);
     int total_nodes = num_replicas + 1;
 
     /* Handle edge case: no replicas, return primary's index */
     if (num_replicas == 0) {
-        serverLog(LL_DEBUG, "Raft: No replicas, quorum index equals last_log_index %lld", rs->last_log_index);
-        return rs->last_log_index;
+        serverLog(LL_DEBUG, "Raft: No replicas, quorum index equals last_log_index %lld", raft_state->last_log_index);
+        return raft_state->last_log_index;
     }
 
     /* Allocate array for all indices (replicas + primary) */
@@ -380,16 +376,16 @@ long long raftStateGetQuorumIndex(void) {
     memset(indices, 0, sizeof(long long) * total_nodes);
 
     /* Collect match indices from replicas */
-    if (rs->match_index) {
+    if (raft_state->match_index) {
         for (int i = 0; i < num_replicas; i++) {
-            indices[i] = rs->match_index[i];
+            indices[i] = raft_state->match_index[i];
         }
     } else {
         serverLog(LL_WARNING, "Raft: match_index array is NULL, treating all replicas as index 0");
     }
 
     /* Add primary's index */
-    indices[num_replicas] = rs->last_log_index;
+    indices[num_replicas] = raft_state->last_log_index;
 
     /* Sort in descending order */
     qsort(indices, total_nodes, sizeof(long long), compareIndicesDesc);
@@ -399,13 +395,13 @@ long long raftStateGetQuorumIndex(void) {
     long long quorum_index = indices[quorum_size - 1];
 
     serverLog(LL_DEBUG, "Raft: Calculated quorum index %lld (nodes: %d, quorum: %d, last_log: %lld)",
-              quorum_index, total_nodes, quorum_size, rs->last_log_index);
+              quorum_index, total_nodes, quorum_size, raft_state->last_log_index);
 
     /* Validate: quorum index should not exceed primary's index */
-    if (quorum_index > rs->last_log_index) {
+    if (quorum_index > raft_state->last_log_index) {
         serverLog(LL_WARNING, "Raft: Quorum index %lld exceeds last_log_index %lld, capping to last_log_index",
-                  quorum_index, rs->last_log_index);
-        quorum_index = rs->last_log_index;
+                  quorum_index, raft_state->last_log_index);
+        quorum_index = raft_state->last_log_index;
     }
 
     zfree(indices);
@@ -424,10 +420,7 @@ long long raftStateGetQuorumIndex(void) {
  */
 __attribute__((unused))
 static int raftStateUpdateQuorumIndex(void) {
-    raftState *rs = server.raft;
-    if (!rs) return 0;
-
-    long long old_commit = rs->commit_index;
+    long long old_commit = raft_state->commit_index;
     long long new_quorum = raftStateGetQuorumIndex();
 
     if (new_quorum > old_commit) {
@@ -459,26 +452,23 @@ static int raftStateHasQuorumForIndex(long long index) {
 /* ================================ State Validation ============================== */
 
 int raftStateValidate(void) {
-    raftState *rs = server.raft;
-    if (!rs) return C_ERR;
-
     /* Validate term is non-negative */
-    if (rs->current_term < 0) {
-        serverLog(LL_WARNING, "Raft: Invalid current_term: %lld", rs->current_term);
+    if (raft_state->current_term < 0) {
+        serverLog(LL_WARNING, "Raft: Invalid current_term: %lld", raft_state->current_term);
         return C_ERR;
     }
 
     /* Validate commit_index <= last_log_index */
-    if (rs->commit_index > rs->last_log_index) {
+    if (raft_state->commit_index > raft_state->last_log_index) {
         serverLog(LL_WARNING, "Raft: commit_index (%lld) > last_log_index (%lld)",
-                  rs->commit_index, rs->last_log_index);
+                  raft_state->commit_index, raft_state->last_log_index);
         return C_ERR;
     }
 
     /* Validate last_applied <= commit_index */
-    if (rs->last_applied > rs->commit_index) {
+    if (raft_state->last_applied > raft_state->commit_index) {
         serverLog(LL_WARNING, "Raft: last_applied (%lld) > commit_index (%lld)",
-                  rs->last_applied, rs->commit_index);
+                  raft_state->last_applied, raft_state->commit_index);
         return C_ERR;
     }
 
@@ -488,7 +478,7 @@ int raftStateValidate(void) {
 /* ================================ Debug and Logging ============================== */
 
 void raftStatePrint(void) {
-    raftState *rs = server.raft;
+    raftState *rs = raft_state;
     if (!rs) {
         serverLog(LL_NOTICE, "Raft state: NULL");
         return;
@@ -497,28 +487,28 @@ void raftStatePrint(void) {
     long long quorum_index = raftStateGetQuorumIndex();
 
     serverLog(LL_NOTICE, "Raft State:");
-    serverLog(LL_NOTICE, "  Role: %s", raftStateRoleString(rs->role));
-    serverLog(LL_NOTICE, "  Term: %lld", rs->current_term);
-    serverLog(LL_NOTICE, "  Voted for: %lld", rs->voted_for);
-    serverLog(LL_NOTICE, "  Commit index: %lld", rs->commit_index);
+    serverLog(LL_NOTICE, "  Role: %s", raftStateRoleString(raft_state->role));
+    serverLog(LL_NOTICE, "  Term: %lld", raft_state->current_term);
+    serverLog(LL_NOTICE, "  Voted for: %lld", raft_state->voted_for);
+    serverLog(LL_NOTICE, "  Commit index: %lld", raft_state->commit_index);
     serverLog(LL_NOTICE, "  Quorum index: %lld", quorum_index);
-    serverLog(LL_NOTICE, "  Last applied: %lld", rs->last_applied);
-    serverLog(LL_NOTICE, "  Last log index: %lld", rs->last_log_index);
-    serverLog(LL_NOTICE, "  Last log term: %lld", rs->last_log_term);
+    serverLog(LL_NOTICE, "  Last applied: %lld", raft_state->last_applied);
+    serverLog(LL_NOTICE, "  Last log index: %lld", raft_state->last_log_index);
+    serverLog(LL_NOTICE, "  Last log term: %lld", raft_state->last_log_term);
 }
 
 sds raftStateToString(void) {
-    raftState *rs = server.raft;
+    raftState *rs = raft_state;
     if (!rs) return sdsnew("NULL");
 
     return sdscatprintf(sdsempty(),
                         "role=%s term=%lld voted_for=%lld commit=%lld applied=%lld "
                         "last_log_idx=%lld last_log_term=%lld",
-                        raftStateRoleString(rs->role),
-                        rs->current_term,
-                        rs->voted_for,
-                        rs->commit_index,
-                        rs->last_applied,
-                        rs->last_log_index,
-                        rs->last_log_term);
+                        raftStateRoleString(raft_state->role),
+                        raft_state->current_term,
+                        raft_state->voted_for,
+                        raft_state->commit_index,
+                        raft_state->last_applied,
+                        raft_state->last_log_index,
+                        raft_state->last_log_term);
 }

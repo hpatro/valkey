@@ -127,24 +127,21 @@ struct hdr_histogram;
 typedef struct raftState raftState;
 
 /* Unified batch replication structures */
-typedef struct batchEntry {
+typedef struct raftEntry {
     int dictid;                 /* Database ID */
     robj **argv;                /* Command arguments */
     int argc;                   /* Argument count */
     size_t *argv_len;           /* Argument lengths */
     struct serverCommand *cmd;  /* Command pointer */
-    long long log_index;
+    long long index;
     long long term;
-} batchEntry;
+} raftEntry;
 
-/* Unified batch entries - used by both primary (sending) and replica (receiving) */
+/* Unified batch entries - used for replica (receiving) */
 typedef struct batchEntries {
     /* Common fields */
     list *operations;           /* List of batchEntry */
-    size_t count;               /* Number of operations */
 } batchEntries;
-
-typedef struct batchEntries batchCollector;
 
 #define RAFT_ENTRY_VERSION 1 /* Current Raft entry format version */
 
@@ -1330,7 +1327,6 @@ typedef struct client {
     ClientReplicationData *repl_data;     /* Required for Replication operations. lazily initialized when first needed */
     ClientModuleData *module_data;        /* Required for Module operations. lazily initialized when first needed */
     multiState *mstate;                   /* MULTI/EXEC state, lazily initialized when first needed */
-    batchEntries *batch_entries;          /* Batch entries for batched replication, lazily initialized when first needed */
     blockingState *bstate;                /* Blocking state, lazily initialized when first needed */
     slotMigrationJob *slot_migration_job; /* Pointer to the slot migration job, or NULL. */
     /* Output buffer and reply handling */
@@ -1710,6 +1706,7 @@ typedef enum childInfoType {
 
 struct valkeyServer {
     durable_t durability;
+    list *operation_log;
     /* General */
     pid_t pid;                /* Main process pid. */
     pthread_t main_thread_id; /* Main thread id */
@@ -3191,18 +3188,8 @@ sds receiveSynchronousResponse(connection *conn);
 ConnectionType *connTypeOfReplication(void);
 robj *generateSelectCommand(int dictid);
 
-/* Unified batch entries functions */
-batchEntries *batchEntriesCreate(void);
-void batchEntriesFree(batchEntries *be);
-void batchEntriesReset(batchEntries *be);
-int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc, struct serverCommand *cmd);
-int batchEntriesShouldFlush(batchEntries *be);
-size_t batchEntriesMemOverhead(batchEntries *be);
-
 /* Replica-side batch operations */
-int batchEntriesExecute(batchEntries *be, client *c);
 void queueAeCommand(client *c);
-void discardAeTransaction(client *c);
 
 /* Generic persistence functions */
 void startLoadingFile(size_t size, char *filename, int rdbflags);

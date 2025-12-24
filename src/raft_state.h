@@ -18,6 +18,7 @@ typedef enum {
 
 /* Raft state structure - encapsulates all Raft consensus state */
 typedef struct raftState {
+    list *operation_log;
     /* Persistent state (should be persisted to stable storage) */
     long long current_term;        /* Latest term server has seen */
     long long voted_for;           /* CandidateId that received vote in current term */
@@ -61,9 +62,13 @@ long long raftStateGetCommitIndex(void);
 void raftStateSetCommitIndex(long long index);
 int raftStateCanCommit(long long index);
 
+/* Log storage */
+void raftStateAddLog(raftEntry *entry);
+
 /* Log index management */
 long long raftStateGetLastLogIndex(void);
 long long raftStateGetLastLogTerm(void);
+long long raftStateGetLastApplied(void);
 void raftStateUpdateLastLog(long long index, long long term);
 long long raftStateIncrementLogIndex(void);
 long long raftStateIncrementLastApplied(void);
@@ -117,4 +122,6 @@ int raftStateValidate(void);
 void raftStatePrint(void);
 sds raftStateToString(void);
 
+/* Entry management */
+raftEntry *createEntry(int dictid, robj **argv, int argc, struct serverCommand *cmd);
 #endif /* __RAFT_STATE_H */

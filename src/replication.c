@@ -59,7 +59,7 @@ void replicationResurrectCachedPrimary(connection *conn);
 void replicationResurrectProvisionalPrimary(void);
 void replicationSendAck(void);
 void sendCommitIndexToReplicas(long long commit_index);
-void batchEntriesProcessDeferred(client *c);
+void batchEntriesProcessDeferred(void); // Add appropriate header for batch processing.
 int replicaPutOnline(client *replica);
 void replicaStartCommandStream(client *replica);
 int cancelReplicationHandshake(int reconnect);
@@ -1538,7 +1538,7 @@ void replconfCommand(client *c) {
             if (server.primary) {
                 raftStateSetCommitIndex(commit_index);
                 /* Process any deferred batches that can now be executed */
-                batchEntriesProcessDeferred(c);
+                batchEntriesProcessDeferred();
                 return;
             }
 

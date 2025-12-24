@@ -7,71 +7,7 @@
 #include "server.h"
 #include "raft_state.h"
 
-void batchEntriesProcessDeferred(client *c);
-
-/* Free a batch operation structure */
-static void freeBatchOperation(void *ptr) {
-    batchEntry *op = ptr;
-    if (op->argv) {
-        for (int i = 0; i < op->argc; i++) {
-            decrRefCount(op->argv[i]);
-        }
-        zfree(op->argv);
-    }
-    if (op->argv_len) zfree(op->argv_len);
-    zfree(op);
-}
-
-/* Create a new batch entries */
-batchEntries *batchEntriesCreate(void) {
-    batchEntries *bc = zcalloc(sizeof(batchEntries));
-    bc->operations = listCreate();
-    listSetFreeMethod(bc->operations, freeBatchOperation);
-    return bc;
-}
-
-/* Free a batch entries and all its resources */
-void batchEntriesFree(batchEntries *bc) {
-    if (!bc) return;
-    if (bc->operations) {
-        listRelease(bc->operations);
-    }
-    zfree(bc);
-}
-
-/* Reset a batch entries for reuse */
-void batchEntriesReset(batchEntries *bc) {
-    if (!bc) return;
-    
-    listEmpty(bc->operations);
-    bc->count = 0;
-}
-
-/* Add an entry to the batch entries */
-int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc, struct serverCommand *cmd) {
-    if (!be) return C_ERR;
-
-    batchEntry *op = zmalloc(sizeof(batchEntry));
-    op->dictid = dictid;
-    op->argc = argc;
-    op->cmd = cmd;
-    op->argv = zmalloc(sizeof(robj *) * argc);
-    op->log_index = raftStateIncrementLogIndex();
-    op->term = raftStateGetCurrentTerm();
-
-    /* Copy arguments */
-    for (int i = 0; i < argc; i++) {
-        op->argv[i] = argv[i];
-        incrRefCount(argv[i]);
-    }
-
-    listAddNodeTail(be->operations, op);
-
-    /* Update batch count */
-    be->count++;
-
-    return C_OK;
-}
+void batchEntriesProcessDeferred(void);
 
 /* Calculate memory overhead of batch entries */
 size_t batchEntriesMemOverhead(batchEntries *bc) {
@@ -83,8 +19,8 @@ size_t batchEntriesMemOverhead(batchEntries *bc) {
     listNode *ln;
     listRewind(bc->operations, &li);
     while ((ln = listNext(&li))) {
-        batchEntry *op = listNodeValue(ln);
-        mem += sizeof(batchEntry);
+        raftEntry *op = listNodeValue(ln);
+        mem += sizeof(raftEntry);
         mem += sizeof(robj *) * op->argc;
         if (op->argv_len) mem += sizeof(size_t) * op->argc;
         for (int i = 0; i < op->argc; i++) {
@@ -123,15 +59,13 @@ static void sendBatchAck(long long log_index, long long commit_index, long long 
 
     
 void queueAeCommand(client *c) {
-    /* Always queue commands on replica side */
-    if (!c->batch_entries) c->batch_entries = batchEntriesCreate();
-    
     /* Increment log index on successful queuing */
     long long new_log_index = raftStateIncrementLogIndex();
     serverLog(LL_DEBUG, "Queued command %s, incremented log index to %lld", 
               c->cmd->fullname, new_log_index);
     
-    batchEntriesAddEntry(c->batch_entries, c->db->id, c->argv, c->argc, c->cmd);
+    raftEntry *entry = createEntry(c->db->id, c->argv, c->argc, c->cmd);
+    raftStateAddLog(entry);
     
     /* Send BATCH-ACK to primary on successful queuing */
     if (c->flag.primary) {
@@ -142,23 +76,16 @@ void queueAeCommand(client *c) {
 /* ================================ DEFERRED EXECUTION ============================== */
 
 /* Process deferred batches that can now be committed */
-void batchEntriesProcessDeferred(client *c) {
-    if (!c->batch_entries) {
-        return;
-    }
-
-    if (c->batch_entries->count == 0) {
-        return;
-    }
-    long long commit_index = raftStateGetCommitIndex();
-    serverLog(LL_DEBUG, "Processing deferred batches: queue_size=%lu, commit_index=%lld",
-              c->batch_entries->count, commit_index);
+void batchEntriesProcessDeferred(void) {
+    serverLog(LL_DEBUG, "Processing deferred batches: queue_size=%lld, commit_index=%lld",
+              raftStateGetLastApplied(), raftStateGetCommitIndex());
 
     listIter li;
     listNode *ln;
-    listRewind(c->batch_entries->operations, &li);
+    listRewind(server.raft->operation_log, &li);
 
     /* Save original client state */
+    client *c = server.primary;
     struct ClientFlags old_flags = c->flag;
     robj **orig_argv = c->argv;
     int orig_argc = c->argc;
@@ -167,8 +94,8 @@ void batchEntriesProcessDeferred(client *c) {
     int old_reply_off = c->flag.reply_off;
 
     while ((ln = listNext(&li))) {
-        batchEntry *op = listNodeValue(ln);
-        if (op->log_index > raftStateGetCommitIndex()) {
+        raftEntry *op = listNodeValue(ln);
+        if (op->index > raftStateGetCommitIndex()) {
             break;
         }
         
@@ -200,8 +127,7 @@ void batchEntriesProcessDeferred(client *c) {
         }
 
         freeClientOriginalArgv(c);
-        listDelNode(c->batch_entries->operations, ln);
-        c->batch_entries->count--;
+        listDelNode(server.raft->operation_log, ln);
     }    
     /* Restore client state */
     c->flag.reply_off = old_reply_off;
