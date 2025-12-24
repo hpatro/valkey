@@ -1534,6 +1534,14 @@ void replconfCommand(client *c) {
             if (getLongLongFromObjectOrReply(c, c->argv[j + 2], &commit_index, NULL) != C_OK) return;
             if (getLongLongFromObjectOrReply(c, c->argv[j + 3], &raft_term, NULL) != C_OK) return;
 
+            /* Replica side processing */
+            if (server.primary) {
+                raftStateSetCommitIndex(commit_index);
+                /* Process any deferred batches that can now be executed */
+                batchEntriesProcessDeferred(c);
+                return;
+            }
+
             /* Find replica index in server.replicas list */
             listIter li;
             listNode *ln;
@@ -1569,34 +1577,6 @@ void replconfCommand(client *c) {
                 serverLog(LL_WARNING, "Could not find replica %s in replicas list for BATCH-ACK processing",
                             replicationGetReplicaName(c));
             }
-
-            /* Note: this command does not reply anything! */
-            return;
-        } else if (!strcasecmp(c->argv[j]->ptr, "commit-index")) {
-            /* REPLCONF COMMIT-INDEX <commit_index>
-             * Used by primary to notify replica of new commit index */
-            long long commit_index;
-
-            if (j + 1 >= c->argc) {
-                addReplyError(c, "REPLCONF COMMIT-INDEX requires commit index");
-                return;
-            }
-
-            if (getLongLongFromObjectOrReply(c, c->argv[j + 1], &commit_index, NULL) != C_OK) return;
-
-            serverLog(LL_DEBUG, "Received COMMIT-INDEX %lld from primary", commit_index);
-
-            /* Update our commit index */
-            if (commit_index > raftStateGetCommitIndex()) {
-                raftStateSetCommitIndex(commit_index);
-                serverLog(LL_DEBUG, "Updated commit index to %lld", commit_index);
-                
-                /* Process any deferred batches that can now be executed */
-                if (server.deferred_batches) {
-                    batchEntriesProcessDeferred(c);
-                }
-            }
-
             /* Note: this command does not reply anything! */
             return;
         } else {
@@ -5296,9 +5276,19 @@ void replicationCron(void) {
             ((server.cluster_enabled && clusterManualFailoverTimeLimit()) || server.failover_end_time) &&
             isPausedActionsWithUpdate(PAUSE_ACTION_REPLICA);
 
-        if (!manual_failover_in_progress) {
-            ping_argv[0] = shared.ping;
-            replicationFeedReplicas(-1, ping_argv, 1);
+        if (server.batch_repl_enabled) {
+            robj *argv[5];
+            argv[0] = shared.replconf;
+            argv[1] = shared.batchack;
+            argv[2] = createStringObjectFromLongLong(raftStateGetLastLogIndex());
+            argv[3] = createStringObjectFromLongLong(raftStateGetCommitIndex());
+            argv[4] = createStringObjectFromLongLong(raftStateGetCurrentTerm());
+            replicationFeedReplicas(-1, argv, 5);
+        } else {
+            if (!manual_failover_in_progress) {
+                ping_argv[0] = shared.ping;
+                replicationFeedReplicas(-1, ping_argv, 1);
+            }
         }
     }
 

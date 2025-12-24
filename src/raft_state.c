@@ -150,6 +150,13 @@ long long raftStateIncrementLogIndex(void) {
     return rs->last_log_index;
 }
 
+long long raftStateIncrementLastApplied(void) {
+    raftState *rs = server.raft;
+    rs->last_applied++;
+    return rs->last_applied;
+}
+
+
 /* ================================ Role Management ============================== */
 
 raftRole raftStateGetRole(void) {

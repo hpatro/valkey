@@ -133,8 +133,8 @@ typedef struct batchEntry {
     int argc;                   /* Argument count */
     size_t *argv_len;           /* Argument lengths */
     struct serverCommand *cmd;  /* Command pointer */
-    int slot;                   /* Cluster slot */
-    client *client;             /* Client that issued the command */
+    long long log_index;
+    long long term;
 } batchEntry;
 
 /* Unified batch entries - used by both primary (sending) and replica (receiving) */
@@ -142,26 +142,9 @@ typedef struct batchEntries {
     /* Common fields */
     list *operations;           /* List of batchEntry */
     size_t count;               /* Number of operations */
-    
-    /* Raft metadata (used by replica side) */
-    long long raft_term;        /* Raft term for this batch */
-    long long raft_index;       /* Raft index for this batch */
-    long long prev_log_index;   /* Index of log entry immediately preceding new ones */
-    long long prev_log_term;    /* Term of prevLogIndex entry */
-    
-    /* Replica-side fields (for validation) */
-    int expected_count;         /* Expected operation count (0 if not replica) */
 } batchEntries;
 
 typedef struct batchEntries batchCollector;
-
-/* Raft entry structures */
-typedef struct raftEntry {
-    long long index;     /* Raft log index */
-    long long term;      /* Raft term */
-    int operation_count; /* Number of operations in this entry */
-    sds payload;         /* Serialized operations payload */
-} raftEntry;
 
 #define RAFT_ENTRY_VERSION 1 /* Current Raft entry format version */
 
@@ -1472,7 +1455,7 @@ struct sharedObjectsStruct {
         *subscribebulk, *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink, *rpop, *lpop, *lpush, *zadd,
         *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right, *hset, *hdel, *hpexpireat, *hpersist, *srem,
         *xgroup, *xclaim, *script, *replconf, *eval, *cluster, *syncslots, *persist, *set, *pexpireat, *pexpire, *time, *pxat, *absttl,
-        *retrycount, *force, *justid, *entriesread, *lastid, *ping, *setid, *keepttl, *load, *createconsumer, *getack,
+        *retrycount, *force, *justid, *entriesread, *lastid, *ping, *setid, *keepttl, *load, *createconsumer, *getack, *batchack,
         *special_asterisk, *special_equals, *default_username, *redacted, *ssubscribebulk, *sunsubscribebulk, *fields,
         *finish, *state, *success, *failed, *name, *message,
         *smessagebulk, *select[PROTO_SHARED_SELECT_CMDS], *integers[OBJ_SHARED_INTEGERS],
@@ -3212,8 +3195,7 @@ robj *generateSelectCommand(int dictid);
 batchEntries *batchEntriesCreate(void);
 void batchEntriesFree(batchEntries *be);
 void batchEntriesReset(batchEntries *be);
-int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc, 
-                         size_t *argv_len, struct serverCommand *cmd, int slot, client *c);
+int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc, struct serverCommand *cmd);
 int batchEntriesShouldFlush(batchEntries *be);
 size_t batchEntriesMemOverhead(batchEntries *be);
 

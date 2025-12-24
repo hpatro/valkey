@@ -66,6 +66,7 @@ long long raftStateGetLastLogIndex(void);
 long long raftStateGetLastLogTerm(void);
 void raftStateUpdateLastLog(long long index, long long term);
 long long raftStateIncrementLogIndex(void);
+long long raftStateIncrementLastApplied(void);
 
 /* Role management */
 raftRole raftStateGetRole(void);

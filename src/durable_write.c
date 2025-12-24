@@ -1,4 +1,5 @@
 #include "durable_write.h"
+#include "raft_state.h"
 #include "expire.h"
 #include "server.h"
 #include <assert.h>
@@ -898,6 +899,12 @@ void postCall(struct client *c) {
 
     if (current_cmd_blocking_offset > tracking_client->clientDurabilityInfo.current_command_repl_offset) {
         tracking_client->clientDurabilityInfo.current_command_repl_offset = current_cmd_blocking_offset;
+        if (!server.primary) {
+            long long new_log_index = raftStateIncrementLogIndex(); /* TODO: It's logged only in the replication stream atm. */
+            raftStateSetCommitIndex(new_log_index);
+            raftStateIncrementLastApplied();
+        }
+
     }
 
     // TODO: handle db level modifications like FLUSHALL, SWAPDB

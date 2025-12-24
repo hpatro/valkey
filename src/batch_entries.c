@@ -45,38 +45,30 @@ void batchEntriesReset(batchEntries *bc) {
     
     listEmpty(bc->operations);
     bc->count = 0;
-    bc->raft_term = 0;
-    bc->raft_index = 0;
-    bc->prev_log_index = 0;
-    bc->prev_log_term = 0;
-    bc->expected_count = 0;
 }
 
 /* Add an entry to the batch entries */
-int batchEntriesAddEntry(batchEntries *bc, int dictid, robj **argv, int argc, 
-                         size_t *argv_len, struct serverCommand *cmd, int slot, client *c) {
-    if (!bc) return C_ERR;
+int batchEntriesAddEntry(batchEntries *be, int dictid, robj **argv, int argc, struct serverCommand *cmd) {
+    if (!be) return C_ERR;
 
     batchEntry *op = zmalloc(sizeof(batchEntry));
     op->dictid = dictid;
     op->argc = argc;
     op->cmd = cmd;
-    op->slot = slot;
-    op->client = c;
     op->argv = zmalloc(sizeof(robj *) * argc);
-    op->argv_len = argv_len ? zmalloc(sizeof(size_t) * argc) : NULL;
+    op->log_index = raftStateIncrementLogIndex();
+    op->term = raftStateGetCurrentTerm();
 
     /* Copy arguments */
     for (int i = 0; i < argc; i++) {
         op->argv[i] = argv[i];
         incrRefCount(argv[i]);
-        if (argv_len) op->argv_len[i] = argv_len[i];
     }
 
-    listAddNodeTail(bc->operations, op);
+    listAddNodeTail(be->operations, op);
 
     /* Update batch count */
-    bc->count++;
+    be->count++;
 
     return C_OK;
 }
@@ -129,96 +121,9 @@ static void sendBatchAck(long long log_index, long long commit_index, long long 
               log_index, commit_index, raft_term, success ? "OK" : "ERROR");
 }
 
-/* Execute all operations in the batch entries (replica-side) */
-// TODO Remove client, we should be able to execute without it.
-int batchEntriesExecute(batchEntries *bc, client *c) {
-    if (!bc || !c) {
-        serverLog(LL_WARNING, "batchEntriesExecute: NULL batch entries or client");
-        return C_ERR;
-    }
-        
-    serverLog(LL_DEBUG, "Executing batch with %zu operations", bc->count);
     
-    /* Save original client state */
-    struct ClientFlags old_flags = c->flag;
-    robj **orig_argv = c->argv;
-    int orig_argc = c->argc;
-    int orig_argv_len = c->argv_len;
-    struct serverCommand *orig_cmd = c->cmd;
-    
-    /* Configure execution environment: no blocking, no replies */
-    c->flag.deny_blocking = 1;
-    int old_reply_off = c->flag.reply_off;
-    c->flag.reply_off = 1;
-    
-    /* Execute all operations */
-    int execution_success = 1;
-    listIter li;
-    listNode *ln;
-    listRewind(bc->operations, &li);
-    
-    int op_num = 0;
-    while ((ln = listNext(&li))) {
-        batchEntry *op = listNodeValue(ln);
-        op_num++;
-        
-        if (!op->cmd) {
-            serverLog(LL_WARNING, "Batch operation %d has NULL command", op_num);
-            execution_success = 0;
-            continue;
-        }
-        
-        serverLog(LL_DEBUG, "Executing batch operation %d: %s (argc=%d)", 
-                  op_num, op->cmd->fullname, op->argc);
-        
-        c->argc = op->argc;
-        c->argv = op->argv;
-        c->argv_len = op->argc;  /* Set to argc since we don't track individual lengths */
-        c->cmd = c->realcmd = op->cmd;
-        
-        /* Check ACL permissions */
-        int acl_errpos;
-        int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
-        if (acl_retval != ACL_OK) {
-            serverLog(LL_WARNING, "Batch operation %d ACL check failed: %s", op_num, op->cmd->fullname);
-            addACLLogEntry(c, acl_retval, ACL_LOG_CTX_MULTI, acl_errpos, NULL, NULL);
-            execution_success = 0;
-        } else {
-            call(c, CMD_CALL_NONE);
-            serverAssert(c->flag.blocked == 0);
-        }
-        
-        freeClientOriginalArgv(c);
-    }
-    
-    serverLog(LL_DEBUG, "Batch execution completed: %s", execution_success ? "SUCCESS" : "FAILED");
-    
-    /* Restore client state */
-    c->flag.reply_off = old_reply_off;
-    if (!old_flags.deny_blocking) c->flag.deny_blocking = 0;
-    c->argv = orig_argv;
-    c->argv_len = orig_argv_len;
-    c->argc = orig_argc;
-    c->cmd = c->realcmd = orig_cmd;
-    
-    /* Send ACK if this is a replica */
-    if (c->flag.replica) {
-        if (execution_success) {
-            /* Increment commit index on successful execution */
-            long long new_commit_index = raftStateIncrementLogIndex();
-            raftStateSetCommitIndex(new_commit_index);
-            
-            sendBatchAck(raftStateGetLastLogIndex(), raftStateGetCommitIndex(), raftStateGetLastLogTerm(), 1, NULL);
-        } else {
-            sendBatchAck(raftStateGetLastLogIndex(), raftStateGetCommitIndex(), raftStateGetLastLogTerm(), 0, "Execution failed");
-        }
-    }
-    
-    return execution_success ? C_OK : C_ERR;
-}
-
 void queueAeCommand(client *c) {
-    /* Always queue commands on replica side, regardless of AE_START marker */
+    /* Always queue commands on replica side */
     if (!c->batch_entries) c->batch_entries = batchEntriesCreate();
     
     /* Increment log index on successful queuing */
@@ -226,69 +131,83 @@ void queueAeCommand(client *c) {
     serverLog(LL_DEBUG, "Queued command %s, incremented log index to %lld", 
               c->cmd->fullname, new_log_index);
     
-    batchEntriesAddEntry(c->batch_entries, c->db->id, c->argv, c->argc, NULL, c->cmd, c->slot, c);
+    batchEntriesAddEntry(c->batch_entries, c->db->id, c->argv, c->argc, c->cmd);
     
     /* Send BATCH-ACK to primary on successful queuing */
     if (c->flag.primary) {
         sendBatchAck(raftStateGetLastLogIndex(), raftStateGetCommitIndex(), raftStateGetLastLogTerm(), 1, NULL);
-    }
-    
-    /* Reset the client's args since we copied them into the batch entries */
-    c->argv = NULL;
-    c->argc = 0;
-    c->argv_len_sum = 0;
-    c->argv_len = 0;
-}
-
-void discardAeTransaction(client *c) {
-    if (c->batch_entries) {
-        batchEntriesFree(c->batch_entries);
-        c->batch_entries = NULL;
-    }
-    c->flag.ae = 0;
+    }    
 }
 
 /* ================================ DEFERRED EXECUTION ============================== */
 
 /* Process deferred batches that can now be committed */
 void batchEntriesProcessDeferred(client *c) {
-    if (!server.deferred_batches || listLength(server.deferred_batches) == 0) {
+    if (!c->batch_entries) {
         return;
     }
 
+    if (c->batch_entries->count == 0) {
+        return;
+    }
     long long commit_index = raftStateGetCommitIndex();
     serverLog(LL_DEBUG, "Processing deferred batches: queue_size=%lu, commit_index=%lld",
-              listLength(server.deferred_batches), commit_index);
+              c->batch_entries->count, commit_index);
 
     listIter li;
-    listNode *ln, *next;
-    listRewind(server.deferred_batches, &li);
+    listNode *ln;
+    listRewind(c->batch_entries->operations, &li);
+
+    /* Save original client state */
+    struct ClientFlags old_flags = c->flag;
+    robj **orig_argv = c->argv;
+    int orig_argc = c->argc;
+    int orig_argv_len = c->argv_len;
+    struct serverCommand *orig_cmd = c->cmd;
+    int old_reply_off = c->flag.reply_off;
 
     while ((ln = listNext(&li))) {
-        batchEntries *bc = listNodeValue(ln);
-
-        /* Check if this batch can be committed */
-        if (raftStateCanCommit(bc->raft_index)) {
-            serverLog(LL_DEBUG, "Executing deferred batch: index=%lld, term=%lld, operations=%zu",
-                      bc->raft_index, bc->raft_term, bc->count);
-
-            /* Execute the batch */
-            int result = batchEntriesExecute(bc, c);
-
-            if (result == C_OK) {
-                serverLog(LL_DEBUG, "Successfully executed batch index=%lld",
-                          bc->raft_index);
-            } else {
-                serverLog(LL_WARNING, "Failed to execute deferred batch index=%lld", bc->raft_index);
-            }
-
-            /* Remove from queue (will be freed by list free method) */
-            next = ln->next;
-            listDelNode(server.deferred_batches, ln);
-            ln = next ? next->prev : NULL; /* Adjust iterator */
-        } else {
-            serverLog(LL_DEBUG, "Batch index=%lld not yet committed (commit_index=%lld), keeping in queue",
-                      bc->raft_index, commit_index);
+        batchEntry *op = listNodeValue(ln);
+        if (op->log_index > raftStateGetCommitIndex()) {
+            break;
         }
-    }
+        
+        if (!op->cmd) {
+            serverPanic("Batch operation has NULL command");
+        }
+        
+        serverLog(LL_DEBUG, "Executing batch operation %s", op->cmd->fullname);
+    
+        /* Configure execution environment: no blocking, no replies */
+        c->flag.deny_blocking = 1;
+        c->flag.reply_off = 1;
+
+        c->argc = op->argc;
+        c->argv = op->argv;
+        c->argv_len = op->argc;
+        c->cmd = c->realcmd = op->cmd;
+        
+        /* Check ACL permissions */
+        int acl_errpos;
+        int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
+        if (acl_retval != ACL_OK) {
+            serverLog(LL_WARNING, "Batch operation: ACL check failed: %s", op->cmd->fullname);
+            addACLLogEntry(c, acl_retval, ACL_LOG_CTX_MULTI, acl_errpos, NULL, NULL);
+        } else {
+            call(c, CMD_CALL_NONE);
+            /* Increment commit index on successful execution */
+            raftStateIncrementLastApplied();
+        }
+
+        freeClientOriginalArgv(c);
+        listDelNode(c->batch_entries->operations, ln);
+        c->batch_entries->count--;
+    }    
+    /* Restore client state */
+    c->flag.reply_off = old_reply_off;
+    if (!old_flags.deny_blocking) c->flag.deny_blocking = 0;
+    c->argv = orig_argv;
+    c->argv_len = orig_argv_len;
+    c->argc = orig_argc;
+    c->cmd = c->realcmd = orig_cmd;
 }

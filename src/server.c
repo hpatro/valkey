@@ -2180,6 +2180,7 @@ void createSharedObjects(void) {
     shared.load = createSharedString("LOAD");
     shared.createconsumer = createSharedString("CREATECONSUMER");
     shared.getack = createSharedString("GETACK");
+    shared.batchack = createSharedString("BATCH-ACK");
     shared.special_asterisk = createSharedString("*");
     shared.special_equals = createSharedString("=");
     shared.redacted = createSharedString("(redacted)");
@@ -2998,7 +2999,7 @@ void initServer(void) {
     /* Primary-side batch entries initialization removed */
 
     /* Initialize deferred batch queue (replica-side) */
-    server.deferred_batches = NULL;
+    server.deferred_batches = listCreate();
 
     /* Create the timer callback, this is our way to process many background
      * operations incrementally, like eviction of unaccessed expired keys, etc. */
@@ -3971,12 +3972,6 @@ void call(client *c, int flags) {
         /* Call alsoPropagate() only if at least one of AOF / replication
          * propagation is needed. */
         if (propagate_flags != PROPAGATE_NONE) {
-            /* Increment log index on primary when command will be replicated */
-            if (propagate_flags & PROPAGATE_REPL) {
-                long long new_log_index = raftStateIncrementLogIndex();
-                serverLog(LL_DEBUG, "Primary incremented log index to %lld for command: %s", 
-                          new_log_index, c->cmd->fullname);
-            }
             alsoPropagate(c->db->id, c->argv, c->argc, propagate_flags, c->slot);
         }
     }
