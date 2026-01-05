@@ -6457,7 +6457,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                                 "raft_last_applied:%lld\r\n"
                                 "raft_last_log_index:%lld\r\n"
                                 "raft_last_log_term:%lld\r\n",
-                                raftStateRoleString(rs->role),
+                                raftStateRoleString(rs->myself->role),
                                 rs->current_term,
                                 rs->voted_for,
                                 rs->commit_index,

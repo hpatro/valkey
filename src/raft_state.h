@@ -16,33 +16,47 @@ typedef enum {
     RAFT_ROLE_LEADER
 } raftRole;
 
+#define NAMELEN 40 /* sha1 hex length */
+typedef struct raftNode {
+    char ip[NET_IP_STR_LEN]; /* Latest known IP address of this node */
+    char name[NAMELEN];      /* Node name, hex string, sha1-size */
+    char shard_id[NAMELEN];  /* shard id, hex string, sha1-size */
+    int tcp_port;            /* Latest known clients TCP port. */
+    int tls_port;            /* Latest known clients TLS port */
+
+    /* Volatile state on leaders (reinitialized after election) */
+    long long next_index;  /* For each server, index of next log entry to send */
+    long long match_index; /* For each server, index of highest log entry known to be replicated */
+
+    /* Node state */
+    raftRole role; /* Current role of this node */
+
+} raftNode;
+
 /* Raft state structure - encapsulates all Raft consensus state */
 typedef struct raftState {
     list *operation_log;
     /* Persistent state (should be persisted to stable storage) */
-    long long current_term;        /* Latest term server has seen */
-    long long voted_for;           /* CandidateId that received vote in current term */
-    
+    long long current_term; /* Latest term server has seen */
+    long long voted_for;    /* CandidateId that received vote in current term */
+
     /* Volatile state on all servers */
-    long long commit_index;        /* Index of highest log entry known to be committed */
-    long long last_applied;        /* Index of highest log entry applied to state machine */
-    
-    /* Volatile state on leaders (reinitialized after election) */
-    long long *next_index;         /* For each server, index of next log entry to send */
-    long long *match_index;        /* For each server, index of highest log entry known to be replicated */
-    
+    long long commit_index; /* Index of highest log entry known to be committed */
+    long long last_applied; /* Index of highest log entry applied to state machine */
+
     /* Log state */
-    long long last_log_index;      /* Index of last entry in log */
-    long long last_log_term;       /* Term of last entry in log */
-    
-    /* Node state */
-    raftRole role;                 /* Current role of this node */
-    mstime_t election_timeout;     /* When to start election (follower/candidate) */
-    mstime_t heartbeat_timeout;    /* When to send next heartbeat (leader) */
-    
+    long long last_log_index; /* Index of last entry in log */
+    long long last_log_term;  /* Term of last entry in log */
+
+    raftNode *myself;
+    raftNode **replicas;
+
+    mstime_t election_timeout;  /* When to start election (follower/candidate) */
+    mstime_t heartbeat_timeout; /* When to send next heartbeat (leader) */
+
     /* Configuration */
-    int election_timeout_ms;       /* Election timeout in milliseconds */
-    int heartbeat_interval_ms;     /* Heartbeat interval in milliseconds */
+    int election_timeout_ms;   /* Election timeout in milliseconds */
+    int heartbeat_interval_ms; /* Heartbeat interval in milliseconds */
 } raftState;
 
 /* ================================ API Functions ============================== */
@@ -119,7 +133,6 @@ long long raftStateGetQuorumIndex(void);
 int raftStateValidate(void);
 
 /* Debug and logging */
-void raftStatePrint(void);
 sds raftStateToString(void);
 
 /* Entry management */
