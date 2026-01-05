@@ -9,28 +9,6 @@
 
 void batchEntriesProcessDeferred(void);
 
-/* Calculate memory overhead of batch entries */
-size_t batchEntriesMemOverhead(batchEntries *bc) {
-    if (!bc) return 0;
-    
-    size_t mem = sizeof(batchEntries);
-    
-    listIter li;
-    listNode *ln;
-    listRewind(bc->operations, &li);
-    while ((ln = listNext(&li))) {
-        raftEntry *op = listNodeValue(ln);
-        mem += sizeof(raftEntry);
-        mem += sizeof(robj *) * op->argc;
-        if (op->argv_len) mem += sizeof(size_t) * op->argc;
-        for (int i = 0; i < op->argc; i++) {
-            mem += sdsAllocSize(op->argv[i]->ptr);
-        }
-    }
-    
-    return mem;
-}
-
 /* ================================ REPLICA-SIDE OPERATIONS ============================== */
 
 /* Send BATCH-ACK to primary with both log index and commit index */

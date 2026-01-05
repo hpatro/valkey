@@ -126,7 +126,7 @@ struct hdr_histogram;
 /* Forward declarations */
 typedef struct raftState raftState;
 
-/* Unified batch replication structures */
+/* Batch operation */
 typedef struct raftEntry {
     int dictid;                /* Database ID */
     robj **argv;               /* Command arguments */
@@ -136,12 +136,6 @@ typedef struct raftEntry {
     long long index;
     long long term;
 } raftEntry;
-
-/* Unified batch entries - used for replica (receiving) */
-typedef struct batchEntries {
-    /* Common fields */
-    list *operations; /* List of batchEntry */
-} batchEntries;
 
 #define RAFT_ENTRY_VERSION 1 /* Current Raft entry format version */
 
