@@ -1542,42 +1542,22 @@ void replconfCommand(client *c) {
                 return;
             }
 
-            /* Find replica index in server.replicas list */
-            listIter li;
-            listNode *ln;
-            int replica_idx = -1;
-            int idx = 0;
+            /* Update match index with the log index from the ACK. Setting it directly on the client, would be better if the data flow is via raftState */
+            // raftStateSetMatchIndex(replica_idx, log_index);
+            c->repl_data->match_index = log_index;
+
+            serverLog(LL_DEBUG, "Updated match_index to %lld for replica %s",
+                            log_index, replicationGetReplicaName(c));
             
-            listRewind(server.replicas, &li);
-            while ((ln = listNext(&li))) {
-                client *replica = listNodeValue(ln);
-                if (replica == c) {
-                    replica_idx = idx;
-                    break;
-                }
-                idx++;
-            }
-            
-            if (replica_idx >= 0) {
-                /* Update match index with the log index from the ACK */
-                raftStateSetMatchIndex(replica_idx, log_index);
-                serverLog(LL_DEBUG, "Updated match_index[%d] = %lld for replica %s",
-                            replica_idx, log_index, replicationGetReplicaName(c));
+            /* Calculate and update quorum index */
+            long long quorum_index = raftStateGetQuorumIndex();
+            if (quorum_index > raftStateGetCommitIndex()) {
+                raftStateSetCommitIndex(quorum_index);
+                serverLog(LL_DEBUG, "Advanced commit index to %lld based on quorum", quorum_index);
                 
-                /* Calculate and update quorum index */
-                long long quorum_index = raftStateGetQuorumIndex();
-                if (quorum_index > raftStateGetCommitIndex()) {
-                    raftStateSetCommitIndex(quorum_index);
-                    serverLog(LL_DEBUG, "Advanced commit index to %lld based on quorum", quorum_index);
-                    
-                    /* Notify all replicas about the new commit index */
-                    sendCommitIndexToReplicas(quorum_index);
-                }
-            } else {
-                serverLog(LL_WARNING, "Could not find replica %s in replicas list for BATCH-ACK processing",
-                            replicationGetReplicaName(c));
+                /* Notify all replicas about the new commit index */
+                sendCommitIndexToReplicas(quorum_index);
             }
-            /* Note: this command does not reply anything! */
             return;
         } else {
             addReplyErrorFormat(c, "Unrecognized REPLCONF option: %s", (char *)c->argv[j]->ptr);

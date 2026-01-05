@@ -59,14 +59,10 @@ static void sendBatchAck(long long log_index, long long commit_index, long long 
 
     
 void queueAeCommand(client *c) {
-    /* Increment log index on successful queuing */
-    long long new_log_index = raftStateIncrementLogIndex();
-    serverLog(LL_DEBUG, "Queued command %s, incremented log index to %lld", 
-              c->cmd->fullname, new_log_index);
-    
     raftEntry *entry = createEntry(c->db->id, c->argv, c->argc, c->cmd);
     raftStateAddLog(entry);
-    
+    serverLog(LL_DEBUG, "Queued command %s, incremented log index to %lld", 
+              c->cmd->fullname, entry->index);
     /* Send BATCH-ACK to primary on successful queuing */
     if (c->flag.primary) {
         sendBatchAck(raftStateGetLastLogIndex(), raftStateGetCommitIndex(), raftStateGetLastLogTerm(), 1, NULL);
@@ -77,8 +73,8 @@ void queueAeCommand(client *c) {
 
 /* Process deferred batches that can now be committed */
 void batchEntriesProcessDeferred(void) {
-    serverLog(LL_DEBUG, "Processing deferred batches: queue_size=%lld, commit_index=%lld",
-              raftStateGetLastApplied(), raftStateGetCommitIndex());
+    serverLog(LL_DEBUG, "Processing deferred batches: queue_size=%lu, commit_index=%lld",
+              listLength(server.raft->operation_log), raftStateGetCommitIndex());
 
     listIter li;
     listNode *ln;
@@ -95,6 +91,7 @@ void batchEntriesProcessDeferred(void) {
 
     while ((ln = listNext(&li))) {
         raftEntry *op = listNodeValue(ln);
+        serverLog(LL_DEBUG, "Processing deferred operation: %lld", op->index);
         if (op->index > raftStateGetCommitIndex()) {
             break;
         }

@@ -24,13 +24,8 @@ typedef struct raftNode {
     int tcp_port;            /* Latest known clients TCP port. */
     int tls_port;            /* Latest known clients TLS port */
 
-    /* Volatile state on leaders (reinitialized after election) */
-    long long next_index;  /* For each server, index of next log entry to send */
-    long long match_index; /* For each server, index of highest log entry known to be replicated */
-
     /* Node state */
     raftRole role; /* Current role of this node */
-
 } raftNode;
 
 /* Raft state structure - encapsulates all Raft consensus state */
@@ -83,7 +78,6 @@ void raftStateAddLog(raftEntry *entry);
 long long raftStateGetLastLogIndex(void);
 long long raftStateGetLastLogTerm(void);
 long long raftStateGetLastApplied(void);
-void raftStateUpdateLastLog(long long index, long long term);
 long long raftStateIncrementLogIndex(void);
 long long raftStateIncrementLastApplied(void);
 

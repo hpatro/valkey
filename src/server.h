@@ -128,11 +128,11 @@ typedef struct raftState raftState;
 
 /* Unified batch replication structures */
 typedef struct raftEntry {
-    int dictid;                 /* Database ID */
-    robj **argv;                /* Command arguments */
-    int argc;                   /* Argument count */
-    size_t *argv_len;           /* Argument lengths */
-    struct serverCommand *cmd;  /* Command pointer */
+    int dictid;                /* Database ID */
+    robj **argv;               /* Command arguments */
+    int argc;                  /* Argument count */
+    size_t *argv_len;          /* Argument lengths */
+    struct serverCommand *cmd; /* Command pointer */
     long long index;
     long long term;
 } raftEntry;
@@ -140,7 +140,7 @@ typedef struct raftEntry {
 /* Unified batch entries - used for replica (receiving) */
 typedef struct batchEntries {
     /* Common fields */
-    list *operations;           /* List of batchEntry */
+    list *operations; /* List of batchEntry */
 } batchEntries;
 
 #define RAFT_ENTRY_VERSION 1 /* Current Raft entry format version */
@@ -911,12 +911,12 @@ typedef struct serverDb {
         unsigned long cursor; /* Cursor of the active expire cycle. */
     } expiry[ACTIVE_EXPIRY_TYPE_COUNT];
 
-    /* fields related to dirty key tracking 
+    /* fields related to dirty key tracking
      * for consistent writes with durability */
-    rax *uncommitted_keys; /* Map of dirty keys to the offset required by replica acknowledgement */
+    rax *uncommitted_keys;       /* Map of dirty keys to the offset required by replica acknowledgement */
     long long dirty_repl_offset; /* Replication offset for a dirty DB */
     raxIterator next_scan_iter;  /* The next iterator for db scan */
-    int scan_in_progress;  /* Flag of showing whether db is in scan or not */
+    int scan_in_progress;        /* Flag of showing whether db is in scan or not */
 } serverDb;
 
 /* forward declaration for functions ctx */
@@ -1199,7 +1199,7 @@ typedef struct ClientFlags {
                                               or client::buf. */
     uint64_t keyspace_notified : 1;        /* Indicates that a keyspace notification was triggered during the execution of the
                                               current command. */
-    uint64_t durable_blocked_client: 1;    /* This is a durable blocked client that is waiting for the server to
+    uint64_t durable_blocked_client : 1;   /* This is a durable blocked client that is waiting for the server to
                                             * acknowledge the write of the command that caused it to be blocked. */
     uint64_t ae : 1;                       /* This client is in an AE_START/AE_END context for batched replication */
 } ClientFlags;
@@ -1248,6 +1248,8 @@ typedef struct ClientReplicationData {
     size_t ref_block_pos;                /* Access position of referenced buffer block,
                                            i.e. the next offset to send. */
     sds replica_nodeid;                  /* Node id in cluster mode. */
+
+    long long match_index; /* Match index */
 } ClientReplicationData;
 
 typedef struct ClientModuleData {
@@ -1397,10 +1399,6 @@ typedef struct client {
     list *deferred_reply;                    /* List of reply objects to be sent to the client, typically after
                                                 the client has been unblocked. */
     unsigned long long deferred_reply_bytes; /* Total bytes of objects in the blocked client pending list.*/
-
-    /* Batched Replication */
-    long long waiting_batch_index; /* Raft index client is waiting for */
-    mstime_t batch_wait_start;     /* When client started waiting */
 
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
@@ -2170,10 +2168,10 @@ struct valkeyServer {
     int batch_ack_timeout_ms;   /* Timeout for ACK responses (milliseconds) */
 
     /* Raft State */
-    struct raftState *raft;        /* Raft consensus state (new API) */
-    
+    struct raftState *raft; /* Raft consensus state (new API) */
+
     /* Batch Processing */
-    list *deferred_batches;        /* Queue of batches waiting for commit (replica-side) */
+    list *deferred_batches; /* Queue of batches waiting for commit (replica-side) */
 
     /* Limits */
     unsigned int maxclients;                    /* Max number of simultaneous clients */
@@ -2984,7 +2982,7 @@ int processIOThreadsWriteDone(void);
 void releaseReplyReferences(client *c);
 void resetLastWrittenBuf(client *c);
 
-//TODO:jules move this elsewhere
+// TODO:jules move this elsewhere
 int getIntFromObject(robj *o, int *target);
 
 int parseExtendedCommandArgumentsOrReply(client *c, int *flags, int *unit, robj **expire, robj **compare_val, int command_type, int max_args);

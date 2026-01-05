@@ -5,6 +5,7 @@
  */
 
 #include "server.h"
+#include "zmalloc.h"
 #include "raft_state.h"
 
 raftState *raft_state = NULL;
@@ -60,6 +61,8 @@ void raftStateInit(void) {
     /* Initialize log state */
     raft_state->last_log_index = 0;
     raft_state->last_log_term = 0;
+
+    raft_state->myself = zmalloc(sizeof(raftNode));
 
     /* Initialize node state */
     raft_state->myself->role = RAFT_ROLE_FOLLOWER;
@@ -166,11 +169,6 @@ long long raftStateGetLastLogTerm(void) {
 
 long long raftStateGetLastApplied(void) {
     return raft_state ? raft_state->last_applied : 0;
-}
-
-void raftStateUpdateLastLog(long long index, long long term) {
-    raft_state->last_log_index = index;
-    raft_state->last_log_term = term;
 }
 
 long long raftStateIncrementLogIndex(void) {
@@ -344,8 +342,13 @@ long long raftStateGetQuorumIndex(void) {
     memset(indices, 0, sizeof(long long) * total_nodes);
 
     /* Collect match indices from replicas */
-    for (int i = 0; i < num_replicas; i++) {
-        indices[i] = raft_state->replicas[i]->match_index;
+    listIter li;
+    listNode *ln;
+    listRewind(server.replicas, &li);
+    int cnt = 0;
+    while ((ln = listNext(&li))) {
+        client *replica = (client *)ln->value;
+        indices[cnt++] = replica->repl_data->match_index;
     }
 
     /* Add primary's index */
@@ -362,11 +365,7 @@ long long raftStateGetQuorumIndex(void) {
               quorum_index, total_nodes, quorum_size, raft_state->last_log_index);
 
     /* Validate: quorum index should not exceed primary's index */
-    if (quorum_index > raft_state->last_log_index) {
-        serverLog(LL_WARNING, "Raft: Quorum index %lld exceeds last_log_index %lld, capping to last_log_index",
-                  quorum_index, raft_state->last_log_index);
-        quorum_index = raft_state->last_log_index;
-    }
+    serverAssert(quorum_index <= raft_state->last_log_index);
 
     zfree(indices);
 
