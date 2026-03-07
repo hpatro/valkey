@@ -67,6 +67,7 @@ typedef struct clusterLink {
     int flags;                             /* CLUSTER_LINK_... */
 } clusterLink;
 
+void processClusterIOAcceptDone(connection *conn);
 int processClusterIOReadDone(clusterLink *link, int while_blocked);
 int processClusterIOWriteDone(clusterLink *link);
 

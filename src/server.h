@@ -1929,6 +1929,8 @@ struct valkeyServer {
     long long stat_io_reads_pending;                   /* Number of read events pending in IO threads */
     long long stat_io_writes_processed;                /* Number of write events processed by IO threads */
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
+    long long stat_cluster_io_accepts_offloaded;       /* Number of cluster accepts offloaded to IO threads */
+    long long stat_cluster_io_accepts_pending;         /* Number of pending cluster accept responses */
     long long stat_cluster_io_reads_offloaded;         /* Number of cluster reads offloaded to IO threads */
     long long stat_cluster_io_reads_pending;           /* Number of pending cluster read responses */
     long long stat_cluster_io_read_fallbacks;          /* Number of synchronous cluster read fallbacks */

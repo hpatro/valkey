@@ -23,6 +23,7 @@ typedef enum {
     JOB_RES_WRITE_CLIENT,
     JOB_RES_READ_CLUSTER,
     JOB_RES_WRITE_CLUSTER,
+    JOB_RES_ACCEPT_CLUSTER,
     JOB_RES_COUNT
 } JobResult;
 _Static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");

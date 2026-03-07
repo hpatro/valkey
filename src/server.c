@@ -2781,6 +2781,8 @@ void resetServerStats(void) {
     server.stat_io_reads_processed = 0;
     server.stat_total_reads_processed = 0;
     server.stat_io_writes_processed = 0;
+    server.stat_cluster_io_accepts_offloaded = 0;
+    server.stat_cluster_io_accepts_pending = 0;
     server.stat_cluster_io_reads_offloaded = 0;
     server.stat_cluster_io_reads_pending = 0;
     server.stat_cluster_io_read_fallbacks = 0;
@@ -6687,6 +6689,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_duration_cron_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CRON].sum,
                 "eventloop_duration_max:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].max,
                 "eventloop_cmd_per_cycle_max:%lld\r\n", server.el_cmd_cnt_max,
+                "cluster_io_accepts_offloaded:%lld\r\n", server.stat_cluster_io_accepts_offloaded,
+                "cluster_io_accepts_pending:%lld\r\n", server.stat_cluster_io_accepts_pending,
                 "io_threaded_reads_pending:%lld\r\n", server.stat_io_reads_pending,
                 "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending,
                 "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_io_reads_offloaded,

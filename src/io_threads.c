@@ -52,7 +52,7 @@ void ioThreadReadClusterLink(clusterLink *link);
 void ioThreadWriteClusterLink(clusterLink *link);
 void IOThreadFreeArgv(robj **argv);
 void IOThreadPoll(aeEventLoop *el);
-static void ioThreadAccept(client *c);
+static void ioThreadAccept(connection *conn);
 
 extern int ProcessingEventsWhileBlocked;
 
@@ -77,8 +77,8 @@ static size_t getPendingIOThreadsJobs(void) {
 
 /* Read/write jobs awaiting response from IO threads. */
 static int getPendingIOResponsesCount(void) {
-    return server.stat_io_writes_pending + server.stat_io_reads_pending + server.stat_cluster_io_reads_pending +
-           server.stat_cluster_io_writes_pending;
+    return server.stat_io_writes_pending + server.stat_io_reads_pending + server.stat_cluster_io_accepts_pending +
+           server.stat_cluster_io_reads_pending + server.stat_cluster_io_writes_pending;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -368,7 +368,7 @@ static void *IOThreadMain(void *myid) {
                 sdsfreeVoid(data);
                 break;
             case JOB_REQ_ACCEPT:
-                ioThreadAccept((client *)data);
+                ioThreadAccept((connection *)data);
                 break;
             case JOB_REQ_READ_CLUSTER:
                 ioThreadReadClusterLink((clusterLink *)data);
@@ -863,16 +863,29 @@ void sendToMainThread(void *data, int type) {
     }
 }
 
-static void ioThreadAccept(client *c) {
-    connAccept(c->conn, NULL);
+static void ioThreadAccept(connection *conn) {
+    connAccept(conn, NULL);
     atomic_thread_fence(memory_order_release);
-    c->io_read_state = CLIENT_COMPLETED_IO;
-    sendToMainThread(c, JOB_RES_READ_CLIENT);
+
+    switch (connGetPrivateDataType(conn)) {
+    case CONN_PRIVATE_DATA_CLIENT: {
+        client *c = connGetPrivateData(conn);
+        serverAssert(c != NULL);
+        c->io_read_state = CLIENT_COMPLETED_IO;
+        sendToMainThread(c, JOB_RES_READ_CLIENT);
+        break;
+    }
+    case CONN_PRIVATE_DATA_CLUSTER_LINK:
+        sendToMainThread(conn, JOB_RES_ACCEPT_CLUSTER);
+        break;
+    default:
+        serverPanic("Unsupported accept owner type %d", connGetPrivateDataType(conn));
+    }
 }
 
 /*
- * Attempts to offload an Accept operation (currently used for TLS accept) for a client
- * connection to I/O threads.
+ * Attempts to offload an Accept operation (currently used for TLS accept) for a
+ * connection owned by a client or cluster link.
  *
  * Returns:
  *   C_OK  - If the accept operation was successfully queued for processing
@@ -882,6 +895,9 @@ static void ioThreadAccept(client *c) {
  *   conn - The connection object to perform the accept operation on
  */
 int trySendAcceptToIOThreads(connection *conn) {
+    client *c = NULL;
+    ConnectionPrivateDataType owner_type = connGetPrivateDataType(conn);
+
     if (server.io_threads_num <= 1) {
         return C_ERR;
     }
@@ -890,32 +906,48 @@ int trySendAcceptToIOThreads(connection *conn) {
         return C_ERR;
     }
 
-    if (connGetPrivateDataType(conn) != CONN_PRIVATE_DATA_CLIENT) {
-        return C_ERR;
+    if (conn->flags & CONN_FLAG_ACCEPT_PENDING_IO) {
+        return C_OK;
     }
 
-    client *c = connGetPrivateData(conn);
-    if (c->io_read_state != CLIENT_IDLE) {
-        return C_OK;
+    if (owner_type == CONN_PRIVATE_DATA_CLIENT) {
+        c = connGetPrivateData(conn);
+        if (c == NULL) return C_ERR;
+        if (c->io_read_state != CLIENT_IDLE) {
+            return C_OK;
+        }
+    } else if (owner_type != CONN_PRIVATE_DATA_CLUSTER_LINK) {
+        return C_ERR;
     }
 
     if (server.active_io_threads_num <= 1) {
         return C_ERR;
     }
 
-    c->io_read_state = CLIENT_PENDING_IO;
-    c->flag.pending_read = 1;
-    connSetPostponeUpdateState(c->conn, 1);
+    conn->flags |= CONN_FLAG_ACCEPT_PENDING_IO;
+    if (c) {
+        c->io_read_state = CLIENT_PENDING_IO;
+        c->flag.pending_read = 1;
+    }
+    connSetPostponeUpdateState(conn, 1);
 
-    void *job = tagJob(c, JOB_REQ_ACCEPT);
+    void *job = tagJob(conn, JOB_REQ_ACCEPT);
     if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) {
-        c->io_read_state = CLIENT_IDLE;
-        c->flag.pending_read = 0;
-        connSetPostponeUpdateState(c->conn, 0);
+        conn->flags &= ~CONN_FLAG_ACCEPT_PENDING_IO;
+        if (c) {
+            c->io_read_state = CLIENT_IDLE;
+            c->flag.pending_read = 0;
+        }
+        connSetPostponeUpdateState(conn, 0);
         return C_ERR;
     }
 
-    server.stat_io_reads_pending++;
+    if (c) {
+        server.stat_io_reads_pending++;
+    } else {
+        server.stat_cluster_io_accepts_pending++;
+        server.stat_cluster_io_accepts_offloaded++;
+    }
     server.stat_io_accept_offloaded++;
     io_jobs_submitted++;
     return C_OK;
@@ -965,6 +997,7 @@ int processIOThreadsResponses(void) {
     void *jobs[JOB_BATCH_SIZE];
     client *read_jobs[JOB_BATCH_SIZE];
     client *write_jobs[JOB_BATCH_SIZE];
+    connection *cluster_accept_jobs[JOB_BATCH_SIZE];
     clusterLink *cluster_read_jobs[JOB_BATCH_SIZE];
     clusterLink *cluster_write_jobs[JOB_BATCH_SIZE];
 
@@ -974,6 +1007,7 @@ int processIOThreadsResponses(void) {
         int dequeued_count = 0;
         int read_count = 0;
         int write_count = 0;
+        int cluster_accept_count = 0;
         int cluster_read_count = 0;
         int cluster_write_count = 0;
         int batch_limit = response_limit - total_processed;
@@ -1005,6 +1039,8 @@ int processIOThreadsResponses(void) {
                 } else if (job_type == JOB_RES_WRITE_CLUSTER) {
                     clusterLink *link = (clusterLink *)data;
                     cluster_write_jobs[cluster_write_count++] = link;
+                } else if (job_type == JOB_RES_ACCEPT_CLUSTER) {
+                    cluster_accept_jobs[cluster_accept_count++] = (connection *)data;
                 } else {
                     serverPanic("Unknown job type %d", job_type);
                 }
@@ -1013,6 +1049,14 @@ int processIOThreadsResponses(void) {
 
         if (read_count) handleReadJobs(read_jobs, read_count);
         if (write_count) handleWriteJobs(write_jobs, write_count);
+        if (cluster_accept_count) {
+            server.stat_cluster_io_accepts_pending -= cluster_accept_count;
+            serverAssert(server.stat_cluster_io_accepts_pending >= 0);
+
+            for (int i = 0; i < cluster_accept_count; i++) {
+                processClusterIOAcceptDone(cluster_accept_jobs[i]);
+            }
+        }
         if (cluster_write_count) {
             server.stat_cluster_io_writes_pending -= cluster_write_count;
             serverAssert(server.stat_cluster_io_writes_pending >= 0);

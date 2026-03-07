@@ -1955,6 +1955,13 @@ static void clusterConnAcceptHandler(connection *conn) {
     connSetReadHandler(conn, clusterReadHandler);
 }
 
+void processClusterIOAcceptDone(connection *conn) {
+    atomic_thread_fence(memory_order_acquire);
+    conn->flags &= ~CONN_FLAG_ACCEPT_PENDING_IO;
+    connSetPostponeUpdateState(conn, 0);
+    connUpdateState(conn);
+}
+
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
     int max = server.tls_cluster ? server.max_new_tls_conns_per_cycle : server.max_new_conns_per_cycle;
@@ -1990,6 +1997,8 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
         /* Use non-blocking I/O for cluster messages. */
         serverLog(LL_VERBOSE, "Accepting cluster node connection from %s:%d", cip, cport);
+        connSetPrivateDataOwner(conn, CONN_PRIVATE_DATA_CLUSTER_LINK, NULL, NULL);
+        conn->flags |= CONN_FLAG_ALLOW_ACCEPT_OFFLOAD;
 
         /* Accept the connection now.  connAccept() may call our handler directly
          * or schedule it for later depending on connection implementation.
@@ -6616,7 +6625,14 @@ void clusterCron(void) {
          * timeout, reconnect the link: maybe there is a connection
          * issue even if the node is alive. */
         mstime_t ping_delay = now - node->ping_sent;
-        mstime_t data_delay = now - node->data_received;
+        mstime_t last_data_time = node->data_received;
+        if (node->link && node->link->last_io_read_time > last_data_time) {
+            last_data_time = node->link->last_io_read_time;
+        }
+        if (node->inbound_link && node->inbound_link->last_io_read_time > last_data_time) {
+            last_data_time = node->inbound_link->last_io_read_time;
+        }
+        mstime_t data_delay = now - last_data_time;
         if (node->link &&                                            /* is connected */
             now - node->link->ctime > server.cluster_node_timeout && /* was not already reconnected */
             node->ping_sent &&                                       /* we already sent a ping */

@@ -65,6 +65,7 @@ typedef enum {
 #define CONN_FLAG_CLOSE_SCHEDULED (1 << 0)      /* Closed scheduled by a handler */
 #define CONN_FLAG_WRITE_BARRIER (1 << 1)        /* Write barrier requested */
 #define CONN_FLAG_ALLOW_ACCEPT_OFFLOAD (1 << 2) /* Connection accept can be offloaded to IO threads. */
+#define CONN_FLAG_ACCEPT_PENDING_IO (1 << 3)    /* Connection accept is currently offloaded to IO threads. */
 
 typedef enum {
     CONN_PRIVATE_DATA_NONE = 0,

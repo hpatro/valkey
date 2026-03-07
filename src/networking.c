@@ -6333,6 +6333,7 @@ void processClientIOReadsDone(client *c) {
 
     c->flag.pending_read = 0;
     c->io_read_state = CLIENT_IDLE;
+    c->conn->flags &= ~CONN_FLAG_ACCEPT_PENDING_IO;
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
     if (c->flag.close_asap) return;
