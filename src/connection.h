@@ -421,7 +421,7 @@ static inline void *connGetPrivateData(connection *conn) {
 }
 
 static inline ConnectionPrivateDataType connGetPrivateDataType(connection *conn) {
-    return conn->private_data_type;
+    return (ConnectionPrivateDataType)conn->private_data_type;
 }
 
 /* Return a text that describes the connection, suitable for inclusion

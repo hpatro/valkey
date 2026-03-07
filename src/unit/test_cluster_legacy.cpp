@@ -1,13 +1,12 @@
 #include "generated_wrappers.hpp"
 
-#include <algorithm>
 #include <cstring>
-#include <limits>
 
 extern "C" {
 #include <arpa/inet.h>
 
 #include "server.h"
+#include "cluster.h"
 #include "cluster_legacy.h"
 
 typedef struct clusterMsgSendBlock {
@@ -61,7 +60,7 @@ static ConnectionType CT_FakeCluster;
 
 static int fakeClusterWrite(connection *conn, const void *data, size_t size) {
     fakeClusterConnection *fake = (fakeClusterConnection *)conn;
-    size_t to_write = std::min(size, fake->max_write);
+    size_t to_write = size < fake->max_write ? size : fake->max_write;
     if (fake->written + to_write > fake->capacity) {
         to_write = fake->capacity - fake->written;
     }
@@ -90,7 +89,7 @@ static fakeClusterConnection *createFakeClusterConnection(size_t capacity) {
     fake->conn.state = CONN_STATE_CONNECTED;
     fake->buffer = (char *)zmalloc(capacity);
     fake->capacity = capacity;
-    fake->max_write = std::numeric_limits<size_t>::max();
+    fake->max_write = (size_t)-1;
     return fake;
 }
 
@@ -256,7 +255,7 @@ TEST_F(ClusterLegacyIOTest, PartialWriteAdvancesInflightOffsetAndPreservesOrder)
     EXPECT_EQ(link->inflight_head_msg_send_offset, first_len - 5);
     EXPECT_EQ(listLength(link->send_msg_queue_inflight), 2u);
 
-    fake->max_write = std::numeric_limits<size_t>::max();
+    fake->max_write = (size_t)-1;
     EXPECT_EQ(testOnlyClusterWriteInflightMessages(link, first_len + second_len, &written, &blocked), CLUSTER_IO_OK);
     EXPECT_EQ(written, second_len + 5);
     EXPECT_EQ(blocked, 0);
