@@ -49,6 +49,7 @@ static inline void untagJob(void *tagged_ptr, void **ptr, int *type) {
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
 void ioThreadReadClusterLink(clusterLink *link);
+void ioThreadWriteClusterLink(clusterLink *link);
 void IOThreadFreeArgv(robj **argv);
 void IOThreadPoll(aeEventLoop *el);
 static void ioThreadAccept(client *c);
@@ -76,7 +77,8 @@ static size_t getPendingIOThreadsJobs(void) {
 
 /* Read/write jobs awaiting response from IO threads. */
 static int getPendingIOResponsesCount(void) {
-    return server.stat_io_writes_pending + server.stat_io_reads_pending + server.stat_cluster_io_reads_pending;
+    return server.stat_io_writes_pending + server.stat_io_reads_pending + server.stat_cluster_io_reads_pending +
+           server.stat_cluster_io_writes_pending;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -371,6 +373,9 @@ static void *IOThreadMain(void *myid) {
             case JOB_REQ_READ_CLUSTER:
                 ioThreadReadClusterLink((clusterLink *)data);
                 break;
+            case JOB_REQ_WRITE_CLUSTER:
+                ioThreadWriteClusterLink((clusterLink *)data);
+                break;
             case JOB_REQ_POLL:
                 IOThreadPoll((aeEventLoop *)data);
                 break;
@@ -584,6 +589,39 @@ int trySendReadClusterToIOThreads(clusterLink *link) {
     io_jobs_submitted++;
     server.stat_cluster_io_reads_pending++;
     server.stat_cluster_io_reads_offloaded++;
+    return C_OK;
+}
+
+int trySendWriteClusterToIOThreads(clusterLink *link) {
+    if (server.active_io_threads_num <= 1) return C_ERR;
+    if (link->io_write_state != CLIENT_IDLE) return C_OK;
+    if (link->io_read_state == CLIENT_PENDING_IO) return C_ERR;
+    if (link->async_close || !link->conn) return C_ERR;
+    if (!link->send_msg_queue_inflight || listLength(link->send_msg_queue_inflight) == 0) return C_ERR;
+
+    link->io_result = CLUSTER_IO_OK;
+    link->io_nwritten = 0;
+    link->io_write_state = CLIENT_PENDING_IO;
+    connSetPostponeUpdateState(link->conn, 1);
+    connIncrRefs(link->conn);
+    link->io_refs++;
+
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_WRITE_CLUSTER)) == false)) {
+        serverAssert(link->io_refs > 0);
+        link->io_refs--;
+        link->io_write_state = CLIENT_IDLE;
+        connSetPostponeUpdateState(link->conn, 0);
+        connDecrRefs(link->conn);
+        if ((link->conn->flags & CONN_FLAG_CLOSE_SCHEDULED) && !connHasRefs(link->conn)) {
+            connClose(link->conn);
+            link->conn = NULL;
+        }
+        return C_ERR;
+    }
+
+    io_jobs_submitted++;
+    server.stat_cluster_io_writes_pending++;
+    server.stat_cluster_io_writes_offloaded++;
     return C_OK;
 }
 
@@ -928,6 +966,7 @@ int processIOThreadsResponses(void) {
     client *read_jobs[JOB_BATCH_SIZE];
     client *write_jobs[JOB_BATCH_SIZE];
     clusterLink *cluster_read_jobs[JOB_BATCH_SIZE];
+    clusterLink *cluster_write_jobs[JOB_BATCH_SIZE];
 
     /* Loop until we consume all pending jobs */
     while (total_processed < response_limit) {
@@ -936,6 +975,7 @@ int processIOThreadsResponses(void) {
         int read_count = 0;
         int write_count = 0;
         int cluster_read_count = 0;
+        int cluster_write_count = 0;
         int batch_limit = response_limit - total_processed;
         if (batch_limit > JOB_BATCH_SIZE) batch_limit = JOB_BATCH_SIZE;
 
@@ -962,6 +1002,9 @@ int processIOThreadsResponses(void) {
                 } else if (job_type == JOB_RES_READ_CLUSTER) {
                     clusterLink *link = (clusterLink *)data;
                     cluster_read_jobs[cluster_read_count++] = link;
+                } else if (job_type == JOB_RES_WRITE_CLUSTER) {
+                    clusterLink *link = (clusterLink *)data;
+                    cluster_write_jobs[cluster_write_count++] = link;
                 } else {
                     serverPanic("Unknown job type %d", job_type);
                 }
@@ -970,6 +1013,14 @@ int processIOThreadsResponses(void) {
 
         if (read_count) handleReadJobs(read_jobs, read_count);
         if (write_count) handleWriteJobs(write_jobs, write_count);
+        if (cluster_write_count) {
+            server.stat_cluster_io_writes_pending -= cluster_write_count;
+            serverAssert(server.stat_cluster_io_writes_pending >= 0);
+
+            for (int i = 0; i < cluster_write_count; i++) {
+                processClusterIOWriteDone(cluster_write_jobs[i]);
+            }
+        }
         if (cluster_read_count) {
             server.stat_cluster_io_reads_pending -= cluster_read_count;
             serverAssert(server.stat_cluster_io_reads_pending >= 0);

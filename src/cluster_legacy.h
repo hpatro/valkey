@@ -68,6 +68,7 @@ typedef struct clusterLink {
 } clusterLink;
 
 int processClusterIOReadDone(clusterLink *link, int while_blocked);
+int processClusterIOWriteDone(clusterLink *link);
 
 /* Cluster link flags and macros. */
 #define CLUSTER_LINK_EXTENSIONS_SUPPORTED (1 << 0) /* This link supports extensions. */

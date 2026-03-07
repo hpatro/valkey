@@ -13,17 +13,19 @@ typedef enum {
     JOB_REQ_POLL,
     JOB_REQ_ACCEPT,
     JOB_REQ_READ_CLUSTER,
+    JOB_REQ_WRITE_CLUSTER,
     JOB_REQ_COUNT
 } JobRequest;
-_Static_assert(JOB_REQ_COUNT <= 7, "JOB_REQ_COUNT must not exceed 7 for pointer arithmetic");
+_Static_assert(JOB_REQ_COUNT <= 8, "JOB_REQ_COUNT must not exceed 8 for pointer arithmetic");
 
 typedef enum {
     JOB_RES_READ_CLIENT = 0,
     JOB_RES_WRITE_CLIENT,
     JOB_RES_READ_CLUSTER,
+    JOB_RES_WRITE_CLUSTER,
     JOB_RES_COUNT
 } JobResult;
-_Static_assert(JOB_RES_COUNT <= 7, "JOB_RES_COUNT must not exceed 7 for pointer arithmetic");
+_Static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
 
 typedef void (*job_handler)(void *);
 
@@ -33,6 +35,7 @@ int inMainThread(void);
 int trySendReadToIOThreads(client *c);
 int trySendWriteToIOThreads(client *c);
 int trySendReadClusterToIOThreads(clusterLink *link);
+int trySendWriteClusterToIOThreads(clusterLink *link);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
 void IOThreadsAfterSleep(int numevents);

@@ -66,6 +66,7 @@ clusterNode *createClusterNode(char *nodename, int flags);
 void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterReadHandler(connection *conn);
+void clusterWriteHandler(connection *conn);
 void clusterSendPing(clusterLink *link, int type);
 void clusterSendFail(char *nodename);
 void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request);
@@ -138,6 +139,13 @@ int clusterDecodeOpenSlotsAuxField(int rdbflags, sds s);
 static int nodeExceedsHandshakeTimeout(clusterNode *node, mstime_t now);
 void clusterCommandFlushslot(client *c);
 void handleLinkIOError(clusterLink *link);
+static void clusterLogWriteResult(clusterLink *link);
+static int clusterSendQueueHasMessages(list *queue);
+static int clusterLinkHasQueuedSendMessages(clusterLink *link);
+static void clusterRotateSendMessageQueues(clusterLink *link);
+static int clusterAdvanceInflightSendQueue(clusterLink *link, size_t advance);
+static clusterIOResult clusterWriteInflightMessages(clusterLink *link, size_t max_bytes, size_t *total_written, int *blocked);
+static int clusterWriteLinkSync(clusterLink *link);
 
 static inline clusterMsg *toClusterMsg(void *buf) {
     clusterMsgHeader *hdr = (clusterMsgHeader *)buf;
@@ -1733,6 +1741,12 @@ static void clusterMsgSendBlockDecrRefCount(void *node) {
     }
 }
 
+static list *clusterCreateSendMessageQueue(void) {
+    list *queue = listCreate();
+    listSetFreeMethod(queue, clusterMsgSendBlockDecrRefCount);
+    return queue;
+}
+
 static void clusterIOPacketFree(void *node) {
     clusterIOPacket *packet = node;
     server.stat_cluster_links_memory -= sizeof(*packet) + packet->len;
@@ -1787,10 +1801,9 @@ static void clusterAccountInboundPacketQueue(clusterLink *link) {
 clusterLink *createClusterLink(clusterNode *node) {
     clusterLink *link = zmalloc(sizeof(*link));
     link->ctime = mstime();
-    link->send_msg_queue = listCreate();
-    listSetFreeMethod(link->send_msg_queue, clusterMsgSendBlockDecrRefCount);
+    link->send_msg_queue = NULL;
     link->head_msg_send_offset = 0;
-    link->send_msg_queue_mem = sizeof(list);
+    link->send_msg_queue_mem = sizeof(list) + sizeof(list);
     link->rcvbuf = zmalloc(link->rcvbuf_alloc = RCVBUF_INIT_LEN);
     link->rcvbuf_len = 0;
     link->rcvbuf_mem_accounted = link->rcvbuf_alloc;
@@ -1804,8 +1817,8 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->io_nwritten = 0;
     link->last_io_read_time = 0;
     link->recv_packet_queue = NULL;
-    link->send_msg_queue_pending = NULL;
-    link->send_msg_queue_inflight = NULL;
+    link->send_msg_queue_pending = clusterCreateSendMessageQueue();
+    link->send_msg_queue_inflight = clusterCreateSendMessageQueue();
     link->inflight_head_msg_send_offset = 0;
     server.stat_cluster_links_memory += link->rcvbuf_alloc + link->send_msg_queue_mem;
     link->conn = NULL;
@@ -4615,6 +4628,17 @@ static void clusterLogReadResult(clusterLink *link) {
     }
 }
 
+static void clusterLogWriteResult(clusterLink *link) {
+    if (link->io_result != CLUSTER_IO_WRITE_ERROR) return;
+
+    const char *err = link->conn ? connGetLastError(link->conn) : "write error";
+    serverLog(LL_DEBUG, "I/O error writing to node link (%.40s:%s) (%s): %s",
+              clusterLinkGetNodeName(link),
+              link->inbound ? "inbound" : "outbound",
+              clusterLinkGetHumanNodeName(link),
+              err);
+}
+
 static void clusterReleaseIOConnRef(clusterLink *link) {
     if (!link->conn) return;
 
@@ -4764,6 +4788,23 @@ void ioThreadReadClusterLink(clusterLink *link) {
     sendToMainThread(link, JOB_RES_READ_CLUSTER);
 }
 
+void ioThreadWriteClusterLink(clusterLink *link) {
+    size_t nwritten = 0;
+
+    serverAssert(link->io_write_state == CLIENT_PENDING_IO);
+    link->io_result = CLUSTER_IO_OK;
+    link->io_nwritten = 0;
+
+    if (clusterSendQueueHasMessages(link->send_msg_queue_inflight)) {
+        link->io_result = clusterWriteInflightMessages(link, NET_MAX_WRITES_PER_EVENT, &nwritten, NULL);
+        link->io_nwritten = nwritten;
+    }
+
+    atomic_thread_fence(memory_order_release);
+    link->io_write_state = CLIENT_COMPLETED_IO;
+    sendToMainThread(link, JOB_RES_WRITE_CLUSTER);
+}
+
 int processClusterIOReadDone(clusterLink *link, int while_blocked) {
     if (link->io_read_state == CLIENT_COMPLETED_IO) {
         atomic_thread_fence(memory_order_acquire);
@@ -4813,6 +4854,48 @@ int processClusterIOReadDone(clusterLink *link, int while_blocked) {
     return 0;
 }
 
+int processClusterIOWriteDone(clusterLink *link) {
+    if (link->io_write_state != CLIENT_COMPLETED_IO) return 0;
+
+    atomic_thread_fence(memory_order_acquire);
+    serverAssert(link->io_refs > 0);
+    link->io_refs--;
+    link->io_write_state = CLIENT_IDLE;
+    clusterReleaseIOConnRef(link);
+
+    if (link->io_result != CLUSTER_IO_OK) {
+        clusterLogWriteResult(link);
+        if (link->async_close) {
+            return clusterLinkFinalizeAsyncFree(link);
+        }
+        handleLinkIOError(link);
+        return 0;
+    }
+
+    serverAssert(clusterAdvanceInflightSendQueue(link, link->io_nwritten) == C_OK);
+
+    if (link->async_close) {
+        return clusterLinkFinalizeAsyncFree(link);
+    }
+
+    if (!clusterLinkHasQueuedSendMessages(link)) {
+        if (link->conn) connSetWriteHandler(link->conn, NULL);
+        return 0;
+    }
+
+    if (!link->conn) return 0;
+
+    connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
+    clusterRotateSendMessageQueues(link);
+    if (trySendWriteClusterToIOThreads(link) == C_OK) {
+        server.el_iteration_active = true;
+        return 0;
+    }
+
+    server.el_iteration_active = true;
+    return 0;
+}
+
 /* This function is called when we detect the link with this node is lost.
    We set the node as no longer connected. The Cluster Cron will detect
    this connection and will try to get it connected again.
@@ -4823,45 +4906,147 @@ void handleLinkIOError(clusterLink *link) {
     freeClusterLink(link);
 }
 
+static int clusterSendQueueHasMessages(list *queue) {
+    return queue && listLength(queue) > 0;
+}
+
+static int clusterLinkHasQueuedSendMessages(clusterLink *link) {
+    return clusterSendQueueHasMessages(link->send_msg_queue_pending) ||
+           clusterSendQueueHasMessages(link->send_msg_queue_inflight);
+}
+
+static void clusterRotateSendMessageQueues(clusterLink *link) {
+    if (clusterSendQueueHasMessages(link->send_msg_queue_inflight) ||
+        !clusterSendQueueHasMessages(link->send_msg_queue_pending))
+        return;
+
+    list *tmp = link->send_msg_queue_inflight;
+    link->send_msg_queue_inflight = link->send_msg_queue_pending;
+    link->send_msg_queue_pending = tmp;
+    link->inflight_head_msg_send_offset = 0;
+}
+
+static void clusterPopInflightSendMessage(clusterLink *link) {
+    listNode *head = listFirst(link->send_msg_queue_inflight);
+    serverAssert(head != NULL);
+
+    clusterMsgSendBlock *msgblock = listNodeValue(head);
+    uint32_t blocklen = msgblock->totlen;
+
+    listDelNode(link->send_msg_queue_inflight, head);
+    server.stat_cluster_links_memory -= sizeof(listNode);
+    link->send_msg_queue_mem -= sizeof(listNode) + blocklen;
+}
+
+static int clusterAdvanceInflightSendQueue(clusterLink *link, size_t advance) {
+    size_t remaining = advance;
+
+    while (remaining > 0) {
+        listNode *head = listFirst(link->send_msg_queue_inflight);
+        if (!head) return C_ERR;
+
+        clusterMsgSendBlock *msgblock = listNodeValue(head);
+        clusterMsg *msg = getMessageFromSendBlock(msgblock);
+        size_t msg_offset = link->inflight_head_msg_send_offset;
+        size_t msg_len = ntohl(msg->totlen);
+        size_t msg_remaining = msg_len - msg_offset;
+
+        if (remaining < msg_remaining) {
+            link->inflight_head_msg_send_offset += remaining;
+            return C_OK;
+        }
+
+        remaining -= msg_remaining;
+        link->inflight_head_msg_send_offset = 0;
+        clusterPopInflightSendMessage(link);
+    }
+
+    if (!clusterSendQueueHasMessages(link->send_msg_queue_inflight)) {
+        link->inflight_head_msg_send_offset = 0;
+    }
+    return C_OK;
+}
+
+static clusterIOResult clusterWriteInflightMessages(clusterLink *link, size_t max_bytes, size_t *total_written, int *blocked) {
+    size_t totwritten = 0;
+    listNode *node = listFirst(link->send_msg_queue_inflight);
+    size_t msg_offset = link->inflight_head_msg_send_offset;
+    if (blocked) *blocked = 0;
+
+    while (totwritten < max_bytes && node) {
+        clusterMsgSendBlock *msgblock = listNodeValue(node);
+        clusterMsg *msg = getMessageFromSendBlock(msgblock);
+        size_t msg_len = ntohl(msg->totlen);
+        size_t msg_remaining = msg_len - msg_offset;
+
+        ssize_t nwritten = connWrite(link->conn, (char *)msg + msg_offset, msg_remaining);
+        if (nwritten <= 0) {
+            *total_written = totwritten;
+            return CLUSTER_IO_WRITE_ERROR;
+        }
+
+        totwritten += nwritten;
+        if ((size_t)nwritten < msg_remaining) {
+            if (blocked) *blocked = 1;
+            break;
+        }
+
+        node = listNextNode(node);
+        msg_offset = 0;
+    }
+
+    *total_written = totwritten;
+    return CLUSTER_IO_OK;
+}
+
+static int clusterWriteLinkSync(clusterLink *link) {
+    size_t totwritten = 0;
+
+    while (totwritten < NET_MAX_WRITES_PER_EVENT) {
+        clusterRotateSendMessageQueues(link);
+        if (!clusterSendQueueHasMessages(link->send_msg_queue_inflight)) break;
+
+        size_t nwritten = 0;
+        int blocked = 0;
+        size_t remaining_budget = NET_MAX_WRITES_PER_EVENT - totwritten;
+        link->io_result = clusterWriteInflightMessages(link, remaining_budget, &nwritten, &blocked);
+        link->io_nwritten = nwritten;
+        if (link->io_result != CLUSTER_IO_OK) return C_ERR;
+        if (clusterAdvanceInflightSendQueue(link, nwritten) == C_ERR) {
+            link->io_result = CLUSTER_IO_WRITE_ERROR;
+            return C_ERR;
+        }
+
+        totwritten += nwritten;
+        if (nwritten == 0) break;
+        if (blocked) break;
+    }
+
+    return C_OK;
+}
+
 /* Send the messages queued for the link. */
 void clusterWriteHandler(connection *conn) {
     clusterLink *link = connGetPrivateData(conn);
-    ssize_t nwritten;
-    size_t totwritten = 0;
-
-    while (totwritten < NET_MAX_WRITES_PER_EVENT && listLength(link->send_msg_queue) > 0) {
-        listNode *head = listFirst(link->send_msg_queue);
-        clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
-        clusterMsg *msg = getMessageFromSendBlock(msgblock);
-        size_t msg_offset = link->head_msg_send_offset;
-        size_t msg_len = ntohl(msg->totlen);
-
-        nwritten = connWrite(conn, (char *)msg + msg_offset, msg_len - msg_offset);
-        if (nwritten <= 0) {
-            serverLog(LL_DEBUG, "I/O error writing to node link: %s",
-                      (nwritten == -1) ? connGetLastError(conn) : "short write");
-            handleLinkIOError(link);
-            return;
-        }
-        if (msg_offset + nwritten < msg_len) {
-            /* If full message wasn't written, record the offset
-             * and continue sending from this point next time */
-            link->head_msg_send_offset += nwritten;
-            return;
-        }
-        serverAssert((msg_offset + nwritten) == msg_len);
-        link->head_msg_send_offset = 0;
-
-        /* Delete the node and update our memory tracking */
-        uint32_t blocklen = msgblock->totlen;
-        listDelNode(link->send_msg_queue, head);
-        server.stat_cluster_links_memory -= sizeof(listNode);
-        link->send_msg_queue_mem -= sizeof(listNode) + blocklen;
-
-        totwritten += nwritten;
+    clusterRotateSendMessageQueues(link);
+    if (!clusterLinkHasQueuedSendMessages(link)) {
+        connSetWriteHandler(link->conn, NULL);
+        return;
     }
 
-    if (listLength(link->send_msg_queue) == 0) connSetWriteHandler(link->conn, NULL);
+    if (trySendWriteClusterToIOThreads(link) == C_OK) return;
+    if (link->io_read_state == CLIENT_PENDING_IO || link->io_write_state != CLIENT_IDLE) return;
+
+    if (server.io_threads_num > 1) server.stat_cluster_io_write_fallbacks++;
+    if (clusterWriteLinkSync(link) != C_OK) {
+        clusterLogWriteResult(link);
+        handleLinkIOError(link);
+        return;
+    }
+
+    if (!clusterLinkHasQueuedSendMessages(link)) {
+        connSetWriteHandler(link->conn, NULL);
+    }
 }
 
 /* A connect handler that gets called when a connection to another node
@@ -4931,10 +5116,12 @@ void clusterSendMessage(clusterLink *link, clusterMsgSendBlock *msgblock) {
     if (!link) {
         return;
     }
-    if (listLength(link->send_msg_queue) == 0 && getMessageFromSendBlock(msgblock)->totlen != 0)
+
+    int had_messages = clusterLinkHasQueuedSendMessages(link);
+    if (!had_messages && getMessageFromSendBlock(msgblock)->totlen != 0)
         connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
 
-    listAddNodeTail(link->send_msg_queue, msgblock);
+    listAddNodeTail(link->send_msg_queue_pending, msgblock);
     msgblock->refcount++;
 
     /* Update memory tracking */

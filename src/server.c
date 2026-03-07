@@ -2784,6 +2784,9 @@ void resetServerStats(void) {
     server.stat_cluster_io_reads_offloaded = 0;
     server.stat_cluster_io_reads_pending = 0;
     server.stat_cluster_io_read_fallbacks = 0;
+    server.stat_cluster_io_writes_offloaded = 0;
+    server.stat_cluster_io_writes_pending = 0;
+    server.stat_cluster_io_write_fallbacks = 0;
     server.stat_cluster_io_async_closed_links = 0;
     server.stat_cluster_io_inbound_packets_queued = 0;
     server.stat_io_freed_objects = 0;
@@ -6689,6 +6692,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_io_reads_offloaded,
                 "cluster_io_reads_pending:%lld\r\n", server.stat_cluster_io_reads_pending,
                 "cluster_io_read_fallbacks:%lld\r\n", server.stat_cluster_io_read_fallbacks,
+                "cluster_io_writes_offloaded:%lld\r\n", server.stat_cluster_io_writes_offloaded,
+                "cluster_io_writes_pending:%lld\r\n", server.stat_cluster_io_writes_pending,
+                "cluster_io_write_fallbacks:%lld\r\n", server.stat_cluster_io_write_fallbacks,
                 "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_io_async_closed_links,
                 "cluster_io_inbound_packets_queued:%lld\r\n", server.stat_cluster_io_inbound_packets_queued));
     }
