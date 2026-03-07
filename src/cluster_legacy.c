@@ -8868,3 +8868,36 @@ bool isAnySlotInManualImportingState(void) {
 bool isAnySlotInManualMigratingState(void) {
     return dictSize(server.cluster->migrating_slots_to) > 0;
 }
+
+/* ========================== Wrapper Functions for Testing ========================== */
+
+clusterIOResult testOnlyClusterFrameInboundPackets(clusterLink *link,
+                                                   int packet_limit,
+                                                   size_t byte_limit,
+                                                   int *framed_packets,
+                                                   size_t *framed_bytes) {
+    return clusterFrameInboundPackets(link, 1, packet_limit, byte_limit, framed_packets, framed_bytes);
+}
+
+void testOnlyClusterEnqueueMessage(clusterLink *link, clusterMsgSendBlock *msgblock) {
+    listAddNodeTail(link->send_msg_queue_pending, msgblock);
+    msgblock->refcount++;
+    link->send_msg_queue_mem += sizeof(listNode) + msgblock->totlen;
+    server.stat_cluster_links_memory += sizeof(listNode);
+}
+
+void testOnlyClusterRotateSendMessageQueues(clusterLink *link) {
+    clusterRotateSendMessageQueues(link);
+}
+
+int testOnlyClusterAdvanceInflightSendQueue(clusterLink *link, size_t advance) {
+    return clusterAdvanceInflightSendQueue(link, advance);
+}
+
+clusterIOResult testOnlyClusterWriteInflightMessages(clusterLink *link, size_t max_bytes, size_t *total_written, int *blocked) {
+    return clusterWriteInflightMessages(link, max_bytes, total_written, blocked);
+}
+
+void testOnlyClusterMsgSendBlockRelease(clusterMsgSendBlock *msgblock) {
+    clusterMsgSendBlockDecrRefCount(msgblock);
+}
