@@ -286,6 +286,7 @@ client *createClient(connection *conn) {
     if (conn) {
         connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
+        connSetPrivateDataOwner(conn, CONN_PRIVATE_DATA_CLIENT, &c->io_read_state, &c->io_write_state);
         conn->flags |= CONN_FLAG_ALLOW_ACCEPT_OFFLOAD;
     }
     c->buf = zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);

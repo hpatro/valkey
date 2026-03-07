@@ -1551,6 +1551,12 @@ static void connTLSShutdown(connection *conn_) {
 static void connTLSClose(connection *conn_) {
     tls_connection *conn = (tls_connection *)conn_;
 
+    if (connHasRefs(conn_)) {
+        connectionTypeTcp()->shutdown(conn_);
+        conn->c.flags |= CONN_FLAG_CLOSE_SCHEDULED;
+        return;
+    }
+
     if (conn->ssl) {
         if (conn->c.state == CONN_STATE_CONNECTED) SSL_shutdown(conn->ssl);
         SSL_free(conn->ssl);
@@ -1623,6 +1629,9 @@ static int connTLSWrite(connection *conn_, const void *data, size_t data_len) {
     tls_connection *conn = (tls_connection *)conn_;
     int ret;
 
+    debugServerAssert(!inMainThread() || conn->c.offload_write_state == NULL ||
+                      *conn->c.offload_write_state != CLIENT_PENDING_IO);
+
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();
     /* In case when last write failed due to some internal reason, retry has to provide
@@ -1690,6 +1699,9 @@ static int connTLSWritev(connection *conn_, const struct iovec *iov, int iovcnt)
 static int connTLSRead(connection *conn_, void *buf, size_t buf_len) {
     tls_connection *conn = (tls_connection *)conn_;
     int ret;
+
+    debugServerAssert(!inMainThread() || conn->c.offload_read_state == NULL ||
+                      *conn->c.offload_read_state != CLIENT_PENDING_IO);
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();

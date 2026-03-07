@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <sys/uio.h>
 
 #include "ae.h"
@@ -64,6 +65,12 @@ typedef enum {
 #define CONN_FLAG_CLOSE_SCHEDULED (1 << 0)      /* Closed scheduled by a handler */
 #define CONN_FLAG_WRITE_BARRIER (1 << 1)        /* Write barrier requested */
 #define CONN_FLAG_ALLOW_ACCEPT_OFFLOAD (1 << 2) /* Connection accept can be offloaded to IO threads. */
+
+typedef enum {
+    CONN_PRIVATE_DATA_NONE = 0,
+    CONN_PRIVATE_DATA_CLIENT,
+    CONN_PRIVATE_DATA_CLUSTER_LINK,
+} ConnectionPrivateDataType;
 
 typedef enum {
     CONN_TYPE_INVALID = -1,
@@ -165,6 +172,9 @@ struct connection {
     short int refs;
     unsigned short int iovcnt;
     void *private_data;
+    volatile uint8_t *offload_read_state;
+    volatile uint8_t *offload_write_state;
+    uint8_t private_data_type;
     ConnectionCallbackFunc conn_handler;
     ConnectionCallbackFunc write_handler;
     ConnectionCallbackFunc read_handler;
@@ -395,9 +405,22 @@ static inline void connSetPrivateData(connection *conn, void *data) {
     conn->private_data = data;
 }
 
+static inline void connSetPrivateDataOwner(connection *conn,
+                                           ConnectionPrivateDataType type,
+                                           volatile uint8_t *read_state,
+                                           volatile uint8_t *write_state) {
+    conn->private_data_type = type;
+    conn->offload_read_state = read_state;
+    conn->offload_write_state = write_state;
+}
+
 /* Get the associated private data pointer */
 static inline void *connGetPrivateData(connection *conn) {
     return conn->private_data;
+}
+
+static inline ConnectionPrivateDataType connGetPrivateDataType(connection *conn) {
+    return conn->private_data_type;
 }
 
 /* Return a text that describes the connection, suitable for inclusion

@@ -157,8 +157,8 @@ static void connSocketClose(connection *conn) {
 
 static int connSocketWrite(connection *conn, const void *data, size_t data_len) {
     /* Assert the main thread is not writing to a connection that is currently offloaded. */
-    debugServerAssert(!(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD) || !inMainThread() ||
-                      ((client *)connGetPrivateData(conn))->io_write_state != CLIENT_PENDING_IO);
+    debugServerAssert(!inMainThread() || conn->offload_write_state == NULL ||
+                      *conn->offload_write_state != CLIENT_PENDING_IO);
 
     int ret = write(conn->fd, data, data_len);
     if (ret < 0 && errno != EAGAIN) {
@@ -174,6 +174,9 @@ static int connSocketWrite(connection *conn, const void *data, size_t data_len) 
 }
 
 static int connSocketWritev(connection *conn, const struct iovec *iov, int iovcnt) {
+    debugServerAssert(!inMainThread() || conn->offload_write_state == NULL ||
+                      *conn->offload_write_state != CLIENT_PENDING_IO);
+
     int ret = writev(conn->fd, iov, iovcnt);
     if (ret < 0 && errno != EAGAIN) {
         conn->last_errno = errno;
@@ -189,8 +192,8 @@ static int connSocketWritev(connection *conn, const struct iovec *iov, int iovcn
 
 static int connSocketRead(connection *conn, void *buf, size_t buf_len) {
     /* Assert the main thread is not reading from a connection that is currently offloaded. */
-    debugServerAssert(!(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD) || !inMainThread() ||
-                      ((client *)connGetPrivateData(conn))->io_read_state != CLIENT_PENDING_IO);
+    debugServerAssert(!inMainThread() || conn->offload_read_state == NULL ||
+                      *conn->offload_read_state != CLIENT_PENDING_IO);
 
 
     int ret = read(conn->fd, buf, buf_len);
