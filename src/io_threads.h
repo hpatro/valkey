@@ -3,6 +3,8 @@
 
 #include "server.h"
 
+typedef struct clusterLink clusterLink;
+
 typedef enum {
     JOB_REQ_READ_CLIENT = 0,
     JOB_REQ_WRITE_CLIENT,
@@ -10,6 +12,7 @@ typedef enum {
     JOB_REQ_FREE_OBJ,
     JOB_REQ_POLL,
     JOB_REQ_ACCEPT,
+    JOB_REQ_READ_CLUSTER,
     JOB_REQ_COUNT
 } JobRequest;
 _Static_assert(JOB_REQ_COUNT <= 7, "JOB_REQ_COUNT must not exceed 7 for pointer arithmetic");
@@ -17,6 +20,7 @@ _Static_assert(JOB_REQ_COUNT <= 7, "JOB_REQ_COUNT must not exceed 7 for pointer 
 typedef enum {
     JOB_RES_READ_CLIENT = 0,
     JOB_RES_WRITE_CLIENT,
+    JOB_RES_READ_CLUSTER,
     JOB_RES_COUNT
 } JobResult;
 _Static_assert(JOB_RES_COUNT <= 7, "JOB_RES_COUNT must not exceed 7 for pointer arithmetic");
@@ -28,6 +32,7 @@ void killIOThreads(void);
 int inMainThread(void);
 int trySendReadToIOThreads(client *c);
 int trySendWriteToIOThreads(client *c);
+int trySendReadClusterToIOThreads(clusterLink *link);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
 void IOThreadsAfterSleep(int numevents);

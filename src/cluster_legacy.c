@@ -43,6 +43,8 @@
 #include "cluster_migrateslots.h"
 #include "endianconv.h"
 #include "connection.h"
+#include "connhelpers.h"
+#include "io_threads.h"
 #include "module.h"
 
 #include <stdlib.h>
@@ -129,12 +131,13 @@ int auxAnnounceClientTlsPortPresent(clusterNode *n);
 int auxAnnounceClientTlsPortPresent(clusterNode *n);
 static void clusterBuildMessageHdrLight(clusterMsgLight *hdr, int type, size_t msglen);
 static void clusterBuildMessageHdr(clusterMsg *hdr, int type, size_t msglen);
-void freeClusterLink(clusterLink *link);
+int freeClusterLink(clusterLink *link);
 int verifyClusterNodeId(const char *name, int length);
 sds clusterEncodeOpenSlotsAuxField(int rdbflags);
 int clusterDecodeOpenSlotsAuxField(int rdbflags, sds s);
 static int nodeExceedsHandshakeTimeout(clusterNode *node, mstime_t now);
 void clusterCommandFlushslot(client *c);
+void handleLinkIOError(clusterLink *link);
 
 static inline clusterMsg *toClusterMsg(void *buf) {
     clusterMsgHeader *hdr = (clusterMsgHeader *)buf;
@@ -229,6 +232,18 @@ static_assert(offsetof(clusterMsg, type) + sizeof(uint16_t) == RCVBUF_MIN_READ_L
               "Incorrect length to read to identify type");
 
 #define RCVBUF_MAX_PREALLOC (1 << 20) /* 1MB */
+
+#define CLUSTER_IO_READ_MAX_PACKETS 16
+#define CLUSTER_IO_READ_MAX_BYTES (64 * 1024)
+#define CLUSTER_IO_APPLY_MAX_PACKETS 64
+#define CLUSTER_IO_APPLY_MAX_USEC 250
+#define CLUSTER_IO_BLOCKED_APPLY_MAX_PACKETS 8
+#define CLUSTER_IO_BLOCKED_APPLY_MAX_USEC 50
+
+typedef struct clusterIOPacket {
+    char *buf;
+    size_t len;
+} clusterIOPacket;
 
 /* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
  * clusterNode structures. */
@@ -1718,6 +1733,57 @@ static void clusterMsgSendBlockDecrRefCount(void *node) {
     }
 }
 
+static void clusterIOPacketFree(void *node) {
+    clusterIOPacket *packet = node;
+    server.stat_cluster_links_memory -= sizeof(*packet) + packet->len;
+    server.stat_cluster_io_inbound_packets_queued--;
+    zfree(packet->buf);
+    zfree(packet);
+}
+
+static list *clusterCreateIOPacketQueue(int account_stats) {
+    list *queue = listCreate();
+    listSetFreeMethod(queue, clusterIOPacketFree);
+    if (account_stats) server.stat_cluster_links_memory += sizeof(list);
+    return queue;
+}
+
+static void clusterMaybeShrinkRcvbuf(clusterLink *link) {
+    if (link->rcvbuf_len != 0 || link->rcvbuf_alloc <= RCVBUF_INIT_LEN) return;
+
+    zfree(link->rcvbuf);
+    link->rcvbuf = zmalloc(link->rcvbuf_alloc = RCVBUF_INIT_LEN);
+}
+
+static int clusterLinkFinalizeAsyncFree(clusterLink *link);
+
+static void clusterUpdateRcvbufMemoryAccounting(clusterLink *link) {
+    ssize_t delta = (ssize_t)link->rcvbuf_alloc - (ssize_t)link->rcvbuf_mem_accounted;
+    if (delta == 0) return;
+
+    server.stat_cluster_links_memory += delta;
+    link->rcvbuf_mem_accounted = link->rcvbuf_alloc;
+}
+
+static void clusterAccountInboundPacketQueue(clusterLink *link) {
+    if (!link->recv_packet_queue) return;
+
+    unsigned long long queue_mem = sizeof(list);
+    unsigned long long packet_count = 0;
+    listIter li;
+    listNode *ln;
+
+    listRewind(link->recv_packet_queue, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        clusterIOPacket *packet = listNodeValue(ln);
+        queue_mem += sizeof(listNode) + sizeof(*packet) + packet->len;
+        packet_count++;
+    }
+
+    server.stat_cluster_links_memory += queue_mem;
+    server.stat_cluster_io_inbound_packets_queued += packet_count;
+}
+
 clusterLink *createClusterLink(clusterNode *node) {
     clusterLink *link = zmalloc(sizeof(*link));
     link->ctime = mstime();
@@ -1727,6 +1793,20 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->send_msg_queue_mem = sizeof(list);
     link->rcvbuf = zmalloc(link->rcvbuf_alloc = RCVBUF_INIT_LEN);
     link->rcvbuf_len = 0;
+    link->rcvbuf_mem_accounted = link->rcvbuf_alloc;
+    link->io_read_state = CLIENT_IDLE;
+    link->io_write_state = CLIENT_IDLE;
+    link->async_close = 0;
+    link->io_refs = 0;
+    link->io_read_completion_pending = 0;
+    link->io_result = CLUSTER_IO_OK;
+    link->io_nread = 0;
+    link->io_nwritten = 0;
+    link->last_io_read_time = 0;
+    link->recv_packet_queue = NULL;
+    link->send_msg_queue_pending = NULL;
+    link->send_msg_queue_inflight = NULL;
+    link->inflight_head_msg_send_offset = 0;
     server.stat_cluster_links_memory += link->rcvbuf_alloc + link->send_msg_queue_mem;
     link->conn = NULL;
     link->node = node;
@@ -1739,24 +1819,49 @@ clusterLink *createClusterLink(clusterNode *node) {
     return link;
 }
 
+static void clusterLinkFinalFree(clusterLink *link) {
+    if (link->conn) {
+        connClose(link->conn);
+        link->conn = NULL;
+    }
+    if (link->send_msg_queue) {
+        server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue) * sizeof(listNode);
+        listRelease(link->send_msg_queue);
+    }
+    if (link->recv_packet_queue) {
+        server.stat_cluster_links_memory -= sizeof(list) + listLength(link->recv_packet_queue) * sizeof(listNode);
+        listRelease(link->recv_packet_queue);
+    }
+    if (link->send_msg_queue_pending) {
+        server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue_pending) * sizeof(listNode);
+        listRelease(link->send_msg_queue_pending);
+    }
+    if (link->send_msg_queue_inflight) {
+        server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue_inflight) * sizeof(listNode);
+        listRelease(link->send_msg_queue_inflight);
+    }
+    server.stat_cluster_links_memory -= link->rcvbuf_mem_accounted;
+    zfree(link->rcvbuf);
+    zfree(link);
+}
+
+static int clusterLinkFinalizeAsyncFree(clusterLink *link) {
+    if (!link->async_close || link->io_refs != 0) return 0;
+
+    clusterLinkFinalFree(link);
+    return 1;
+}
+
 /* Free a cluster link, but does not free the associated node of course.
  * This function will just make sure that the original node associated
  * with this link will have the 'link' field set to NULL. */
-void freeClusterLink(clusterLink *link) {
+int freeClusterLink(clusterLink *link) {
     serverAssert(link != NULL);
     serverLog(LL_DEBUG, "Freeing cluster link for node: %.40s:%s (%s)",
               clusterLinkGetNodeName(link),
               link->inbound ? "inbound" : "outbound",
               clusterLinkGetHumanNodeName(link));
 
-    if (link->conn) {
-        connClose(link->conn);
-        link->conn = NULL;
-    }
-    server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue) * sizeof(listNode);
-    listRelease(link->send_msg_queue);
-    server.stat_cluster_links_memory -= link->rcvbuf_alloc;
-    zfree(link->rcvbuf);
     if (link->node) {
         if (link->node->link == link) {
             serverAssert(!link->inbound);
@@ -1767,7 +1872,20 @@ void freeClusterLink(clusterLink *link) {
             link->node->inbound_link_freed_time = mstime();
         }
     }
-    zfree(link);
+
+    if (link->io_refs > 0) {
+        if (link->conn) {
+            connClose(link->conn);
+        }
+        if (!link->async_close) {
+            server.stat_cluster_io_async_closed_links++;
+        }
+        link->async_close = 1;
+        return 0;
+    }
+
+    clusterLinkFinalFree(link);
+    return 1;
 }
 
 void setClusterNodeToInboundClusterLink(clusterNode *node, clusterLink *link) {
@@ -1818,6 +1936,7 @@ static void clusterConnAcceptHandler(connection *conn) {
     link = createClusterLink(NULL);
     link->conn = conn;
     connSetPrivateData(conn, link);
+    connSetPrivateDataOwner(conn, CONN_PRIVATE_DATA_CLUSTER_LINK, &link->io_read_state, &link->io_write_state);
 
     /* Register read handler */
     connSetReadHandler(conn, clusterReadHandler);
@@ -3571,8 +3690,8 @@ static void clusterProcessModulePacket(clusterMsgModule *module_data, clusterNod
     sdsfree(sender_name);
 }
 
-static void clusterProcessLightPacket(clusterNode *sender, clusterLink *link, uint16_t type) {
-    clusterMsgLight *hdr = (clusterMsgLight *)link->rcvbuf;
+static void clusterProcessLightPacket(clusterNode *sender, const char *packet, uint16_t type) {
+    clusterMsgLight *hdr = (clusterMsgLight *)packet;
     serverLog(LL_DEBUG, "Processing light packet of type: %s", clusterGetMessageTypeString(type));
     if (type == CLUSTERMSG_TYPE_PUBLISH || type == CLUSTERMSG_TYPE_PUBLISHSHARD) {
         clusterProcessPublishPacket(&hdr->data.publish.msg, type);
@@ -3581,6 +3700,16 @@ static void clusterProcessLightPacket(clusterNode *sender, clusterLink *link, ui
     } else {
         serverAssert(0);
     }
+}
+
+static inline clusterIOResult clusterValidatePacketFramingHeader(clusterMsgHeader *hdr) {
+    if (memcmp(hdr->sig, "RCmb", 4) != 0) return CLUSTER_IO_BAD_HEADER;
+
+    uint16_t type = ntohs(hdr->type);
+    uint32_t totlen = ntohl(hdr->totlen);
+    uint32_t minlen = IS_LIGHT_MESSAGE(type) ? CLUSTERMSG_LIGHT_MIN_LEN : CLUSTERMSG_MIN_LEN;
+    if (totlen < minlen) return CLUSTER_IO_BAD_LENGTH;
+    return CLUSTER_IO_OK;
 }
 
 static inline int messageTypeSupportsLightHdr(uint16_t type) {
@@ -3592,8 +3721,9 @@ static inline int messageTypeSupportsLightHdr(uint16_t type) {
     return 0;
 }
 
-int clusterIsValidPacket(clusterLink *link) {
-    clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;
+static int clusterIsValidPacketBuffer(clusterLink *link, const char *packet, size_t packet_len) {
+    UNUSED(link);
+    clusterMsgHeader *hdr = (clusterMsgHeader *)packet;
     uint32_t totlen = ntohl(hdr->totlen);
     int is_light = IS_LIGHT_MESSAGE(ntohs(hdr->type));
     uint16_t type = ntohs(hdr->type) & ~CLUSTERMSG_MODIFIER_MASK;
@@ -3612,7 +3742,7 @@ int clusterIsValidPacket(clusterLink *link) {
 
     /* Perform sanity checks */
     if (totlen < 16) return 0; /* At least signature, version, totlen, count. */
-    if (totlen > link->rcvbuf_len) return 0;
+    if (totlen > packet_len) return 0;
 
     if (ntohs(hdr->ver) != CLUSTER_PROTO_VER) {
         /* Can't handle messages of different versions. */
@@ -3628,7 +3758,7 @@ int clusterIsValidPacket(clusterLink *link) {
     uint32_t explen; /* expected length of this packet */
 
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG || type == CLUSTERMSG_TYPE_MEET) {
-        clusterMsg *msg = toClusterMsg(link->rcvbuf);
+        clusterMsg *msg = toClusterMsg((void *)packet);
         uint16_t extensions = ntohs(msg->extensions);
         uint16_t count = ntohs(msg->count);
 
@@ -3684,11 +3814,11 @@ int clusterIsValidPacket(clusterLink *link) {
     } else if (type == CLUSTERMSG_TYPE_PUBLISH || type == CLUSTERMSG_TYPE_PUBLISHSHARD) {
         clusterMsgDataPublish *publish_data;
         if (is_light) {
-            clusterMsgLight *msg_light = toClusterMsgLight(link->rcvbuf);
+            clusterMsgLight *msg_light = toClusterMsgLight((void *)packet);
             publish_data = &msg_light->data.publish.msg;
             explen = sizeof(clusterMsgLight);
         } else {
-            clusterMsg *msg = toClusterMsg(link->rcvbuf);
+            clusterMsg *msg = toClusterMsg((void *)packet);
             publish_data = &msg->data.publish.msg;
             explen = sizeof(clusterMsg);
         }
@@ -3703,11 +3833,11 @@ int clusterIsValidPacket(clusterLink *link) {
         explen += sizeof(clusterMsgDataUpdate);
     } else if (type == CLUSTERMSG_TYPE_MODULE) {
         if (is_light) {
-            clusterMsgLight *msg_light = toClusterMsgLight(link->rcvbuf);
+            clusterMsgLight *msg_light = toClusterMsgLight((void *)packet);
             explen = sizeof(clusterMsgLight) - sizeof(union clusterMsgData);
             explen += sizeof(clusterMsgModule) - 3 + ntohl(msg_light->data.module.msg.len);
         } else {
-            clusterMsg *msg = toClusterMsg(link->rcvbuf);
+            clusterMsg *msg = toClusterMsg((void *)packet);
             explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
             explen += sizeof(clusterMsgModule) - 3 + ntohl(msg->data.module.msg.len);
         }
@@ -3723,6 +3853,10 @@ int clusterIsValidPacket(clusterLink *link) {
     }
 
     return 1;
+}
+
+int clusterIsValidPacket(clusterLink *link) {
+    return clusterIsValidPacketBuffer(link, link->rcvbuf, link->rcvbuf_len);
 }
 
 /* When iterating through the slot bitmap, group every 64 bits as
@@ -3744,10 +3878,10 @@ static inline int clusterExtractSlotFromWord(uint64_t *slot_word, size_t slot_wo
  * was processed, otherwise 0 if the link was freed since the packet
  * processing lead to some inconsistency error (for instance a PONG
  * received from the wrong sender ID). */
-int clusterProcessPacket(clusterLink *link) {
+static int clusterProcessPacketBuffer(clusterLink *link, const char *packet, size_t packet_len) {
     /* Validate that the packet is well-formed */
-    if (!clusterIsValidPacket(link)) {
-        clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;
+    if (!clusterIsValidPacketBuffer(link, packet, packet_len)) {
+        clusterMsgHeader *hdr = (clusterMsgHeader *)packet;
         uint16_t type = ntohs(hdr->type);
         if (server.debug_cluster_close_link_on_packet_drop &&
             (type == server.cluster_drop_packet_filter || server.cluster_drop_packet_filter == -2)) {
@@ -3758,7 +3892,7 @@ int clusterProcessPacket(clusterLink *link) {
         return 1;
     }
 
-    clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;
+    clusterMsgHeader *hdr = (clusterMsgHeader *)packet;
     mstime_t now = mstime();
     int is_light = IS_LIGHT_MESSAGE(ntohs(hdr->type));
     uint16_t type = ntohs(hdr->type) & ~CLUSTERMSG_MODIFIER_MASK;
@@ -3776,11 +3910,11 @@ int clusterProcessPacket(clusterLink *link) {
         }
         clusterNode *sender = link->node;
         sender->data_received = now;
-        clusterProcessLightPacket(sender, link, type);
+        clusterProcessLightPacket(sender, packet, type);
         return 1;
     }
 
-    clusterMsg *msg = toClusterMsg(link->rcvbuf);
+    clusterMsg *msg = toClusterMsg((void *)packet);
     uint16_t flags = ntohs(msg->flags);
     uint64_t sender_claimed_current_epoch = 0, sender_claimed_config_epoch = 0;
     clusterNode *sender = getNodeFromLinkAndMsg(link, msg);
@@ -4383,6 +4517,302 @@ int clusterProcessPacket(clusterLink *link) {
     return 1;
 }
 
+int clusterProcessPacket(clusterLink *link) {
+    return clusterProcessPacketBuffer(link, link->rcvbuf, link->rcvbuf_len);
+}
+
+static int clusterEnsureRcvbufCapacity(clusterLink *link, size_t additional) {
+    size_t unused = link->rcvbuf_alloc - link->rcvbuf_len;
+    if (additional <= unused) return C_OK;
+
+    size_t required = link->rcvbuf_len + additional;
+    /* If less than 1mb, grow to twice the needed size, if larger grow by 1mb. */
+    link->rcvbuf_alloc = required < RCVBUF_MAX_PREALLOC ? required * 2 : required + RCVBUF_MAX_PREALLOC;
+    link->rcvbuf = zrealloc(link->rcvbuf, link->rcvbuf_alloc);
+    return C_OK;
+}
+
+static void clusterQueueInboundPacket(clusterLink *link, const char *packet, size_t packet_len, int account_stats) {
+    clusterIOPacket *queued_packet = zmalloc(sizeof(*queued_packet));
+    queued_packet->buf = zmalloc(packet_len);
+    queued_packet->len = packet_len;
+    memcpy(queued_packet->buf, packet, packet_len);
+
+    if (!link->recv_packet_queue) {
+        link->recv_packet_queue = clusterCreateIOPacketQueue(account_stats);
+    }
+
+    listAddNodeTail(link->recv_packet_queue, queued_packet);
+    if (account_stats) {
+        server.stat_cluster_links_memory += sizeof(listNode) + sizeof(*queued_packet) + packet_len;
+        server.stat_cluster_io_inbound_packets_queued++;
+    }
+}
+
+static clusterIOResult clusterFrameInboundPackets(clusterLink *link,
+                                                  int account_stats,
+                                                  int packet_limit,
+                                                  size_t byte_limit,
+                                                  int *framed_packets,
+                                                  size_t *framed_bytes) {
+    int packets = 0;
+    size_t bytes = 0;
+
+    while (link->rcvbuf_len >= RCVBUF_MIN_READ_LEN) {
+        clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;
+        clusterIOResult result = clusterValidatePacketFramingHeader(hdr);
+        if (result != CLUSTER_IO_OK) return result;
+
+        uint32_t packet_len = ntohl(hdr->totlen);
+        if (link->rcvbuf_len < packet_len) break;
+
+        clusterQueueInboundPacket(link, link->rcvbuf, packet_len, account_stats);
+
+        size_t remaining = link->rcvbuf_len - packet_len;
+        if (remaining) {
+            memmove(link->rcvbuf, link->rcvbuf + packet_len, remaining);
+        }
+        link->rcvbuf_len = remaining;
+
+        packets++;
+        bytes += packet_len;
+
+        if ((packet_limit > 0 && packets >= packet_limit) || (byte_limit > 0 && bytes >= byte_limit)) break;
+    }
+
+    if (framed_packets) *framed_packets += packets;
+    if (framed_bytes) *framed_bytes += bytes;
+    return CLUSTER_IO_OK;
+}
+
+static void clusterLogPacketFramingError(clusterLink *link, clusterIOResult result) {
+    char ip[NET_IP_STR_LEN];
+    int port;
+    int have_peer_addr = link->conn && connAddrPeerName(link->conn, ip, sizeof(ip), &port) != -1;
+    const char *reason = result == CLUSTER_IO_BAD_HEADER ? "Bad message signature" : "Bad message length";
+
+    if (have_peer_addr) {
+        serverLog(LL_WARNING, "%s received on the Cluster bus from %s:%d", reason, ip, port);
+    } else {
+        serverLog(LL_WARNING, "%s received on the Cluster bus.", reason);
+    }
+}
+
+static void clusterLogReadResult(clusterLink *link) {
+    if (link->io_result == CLUSTER_IO_BAD_HEADER || link->io_result == CLUSTER_IO_BAD_LENGTH) {
+        clusterLogPacketFramingError(link, link->io_result);
+        return;
+    }
+
+    if (link->io_result == CLUSTER_IO_EOF || link->io_result == CLUSTER_IO_READ_ERROR) {
+        const char *err = (link->conn && link->io_result == CLUSTER_IO_READ_ERROR) ? connGetLastError(link->conn)
+                                                                                    : "connection closed";
+        serverLog(LL_DEBUG, "I/O error reading from node link (%.40s:%s) (%s): %s",
+                  clusterLinkGetNodeName(link),
+                  link->inbound ? "inbound" : "outbound",
+                  clusterLinkGetHumanNodeName(link),
+                  err);
+    }
+}
+
+static void clusterReleaseIOConnRef(clusterLink *link) {
+    if (!link->conn) return;
+
+    connection *conn = link->conn;
+    connSetPostponeUpdateState(conn, 0);
+    connUpdateState(conn);
+    connDecrRefs(conn);
+    if ((conn->flags & CONN_FLAG_CLOSE_SCHEDULED) && !connHasRefs(conn)) {
+        connClose(conn);
+        if (link->conn == conn) link->conn = NULL;
+    }
+}
+
+static int clusterFinalizeReadCompletion(clusterLink *link) {
+    if (!link->io_read_completion_pending) return 0;
+
+    link->io_read_completion_pending = 0;
+    serverAssert(link->io_refs > 0);
+    link->io_refs--;
+
+    if (link->async_close) {
+        clusterLinkFinalizeAsyncFree(link);
+    }
+    return 0;
+}
+
+static int clusterProcessQueuedPackets(clusterLink *link, int packet_limit, ustime_t time_limit_us) {
+    monotime start = time_limit_us ? getMonotonicUs() : 0;
+    int processed = 0;
+
+    while (link->recv_packet_queue && listLength(link->recv_packet_queue) > 0) {
+        if (packet_limit > 0 && processed >= packet_limit) break;
+        if (time_limit_us > 0 && processed > 0 && getMonotonicUs() - start >= (monotime)time_limit_us) break;
+
+        listNode *head = listFirst(link->recv_packet_queue);
+        clusterIOPacket *packet = listNodeValue(head);
+        if (!clusterProcessPacketBuffer(link, packet->buf, packet->len)) {
+            return 0;
+        }
+
+        server.stat_cluster_links_memory -= sizeof(listNode);
+        listDelNode(link->recv_packet_queue, head);
+        processed++;
+    }
+
+    if (link->recv_packet_queue && listLength(link->recv_packet_queue) == 0) {
+        server.stat_cluster_links_memory -= sizeof(list);
+        listRelease(link->recv_packet_queue);
+        link->recv_packet_queue = NULL;
+    }
+
+    clusterMaybeShrinkRcvbuf(link);
+    clusterUpdateRcvbufMemoryAccounting(link);
+    return 1;
+}
+
+static void clusterReadLinkSync(clusterLink *link) {
+    clusterMsg buf[1];
+
+    while (1) {
+        clusterIOResult frame_result = clusterFrameInboundPackets(link, 1, 0, 0, NULL, NULL);
+        if (frame_result != CLUSTER_IO_OK) {
+            clusterLogPacketFramingError(link, frame_result);
+            handleLinkIOError(link);
+            return;
+        }
+
+        if (link->recv_packet_queue && !clusterProcessQueuedPackets(link, 0, 0)) {
+            return;
+        }
+
+        unsigned int rcvbuflen = link->rcvbuf_len;
+        unsigned int readlen;
+        if (rcvbuflen < RCVBUF_MIN_READ_LEN) {
+            readlen = RCVBUF_MIN_READ_LEN - rcvbuflen;
+        } else {
+            clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;
+            readlen = ntohl(hdr->totlen) - rcvbuflen;
+            if (readlen > sizeof(buf)) readlen = sizeof(buf);
+        }
+
+        ssize_t nread = connRead(link->conn, buf, readlen);
+        if (nread == -1 && (connGetState(link->conn) == CONN_STATE_CONNECTED)) return;
+
+        if (nread <= 0) {
+            link->io_result = (nread == 0) ? CLUSTER_IO_EOF : CLUSTER_IO_READ_ERROR;
+            clusterLogReadResult(link);
+            handleLinkIOError(link);
+            return;
+        }
+
+        clusterEnsureRcvbufCapacity(link, nread);
+        clusterUpdateRcvbufMemoryAccounting(link);
+        memcpy(link->rcvbuf + link->rcvbuf_len, buf, nread);
+        link->rcvbuf_len += nread;
+        link->last_io_read_time = mstime();
+    }
+}
+
+void ioThreadReadClusterLink(clusterLink *link) {
+    clusterMsg buf[1];
+    int framed_packets = 0;
+    size_t framed_bytes = 0;
+
+    serverAssert(link->io_read_state == CLIENT_PENDING_IO);
+    link->io_result = CLUSTER_IO_OK;
+    link->io_nread = 0;
+
+    while (framed_packets < CLUSTER_IO_READ_MAX_PACKETS && framed_bytes < CLUSTER_IO_READ_MAX_BYTES) {
+        clusterIOResult frame_result =
+            clusterFrameInboundPackets(link, 0, CLUSTER_IO_READ_MAX_PACKETS, CLUSTER_IO_READ_MAX_BYTES, &framed_packets,
+                                       &framed_bytes);
+        if (frame_result != CLUSTER_IO_OK) {
+            link->io_result = frame_result;
+            break;
+        }
+
+        if (framed_packets >= CLUSTER_IO_READ_MAX_PACKETS || framed_bytes >= CLUSTER_IO_READ_MAX_BYTES) break;
+
+        unsigned int rcvbuflen = link->rcvbuf_len;
+        unsigned int readlen;
+        if (rcvbuflen < RCVBUF_MIN_READ_LEN) {
+            readlen = RCVBUF_MIN_READ_LEN - rcvbuflen;
+        } else {
+            clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;
+            readlen = ntohl(hdr->totlen) - rcvbuflen;
+            if (readlen > sizeof(buf)) readlen = sizeof(buf);
+        }
+
+        ssize_t nread = connRead(link->conn, buf, readlen);
+        if (nread == -1 && connGetState(link->conn) == CONN_STATE_CONNECTED) break;
+
+        if (nread <= 0) {
+            link->io_result = (nread == 0) ? CLUSTER_IO_EOF : CLUSTER_IO_READ_ERROR;
+            break;
+        }
+
+        clusterEnsureRcvbufCapacity(link, nread);
+        memcpy(link->rcvbuf + link->rcvbuf_len, buf, nread);
+        link->rcvbuf_len += nread;
+        link->io_nread += nread;
+        link->last_io_read_time = mstime();
+    }
+
+    atomic_thread_fence(memory_order_release);
+    link->io_read_state = CLIENT_COMPLETED_IO;
+    sendToMainThread(link, JOB_RES_READ_CLUSTER);
+}
+
+int processClusterIOReadDone(clusterLink *link, int while_blocked) {
+    if (link->io_read_state == CLIENT_COMPLETED_IO) {
+        atomic_thread_fence(memory_order_acquire);
+        clusterUpdateRcvbufMemoryAccounting(link);
+        clusterAccountInboundPacketQueue(link);
+        link->io_read_completion_pending = 1;
+        link->io_read_state = CLIENT_IDLE;
+
+        if (link->io_result != CLUSTER_IO_OK) {
+            clusterLogReadResult(link);
+            clusterReleaseIOConnRef(link);
+            if (link->async_close) {
+                clusterFinalizeReadCompletion(link);
+                return 0;
+            }
+            clusterFinalizeReadCompletion(link);
+            handleLinkIOError(link);
+            return 0;
+        }
+
+        clusterReleaseIOConnRef(link);
+        if (link->async_close) {
+            clusterFinalizeReadCompletion(link);
+            return 0;
+        }
+    }
+
+    if (!link->recv_packet_queue || listLength(link->recv_packet_queue) == 0) {
+        clusterMaybeShrinkRcvbuf(link);
+        clusterUpdateRcvbufMemoryAccounting(link);
+        clusterFinalizeReadCompletion(link);
+        return 0;
+    }
+
+    int packet_limit = while_blocked ? CLUSTER_IO_BLOCKED_APPLY_MAX_PACKETS : CLUSTER_IO_APPLY_MAX_PACKETS;
+    ustime_t time_limit_us = while_blocked ? CLUSTER_IO_BLOCKED_APPLY_MAX_USEC : CLUSTER_IO_APPLY_MAX_USEC;
+    if (!clusterProcessQueuedPackets(link, packet_limit, time_limit_us)) {
+        clusterFinalizeReadCompletion(link);
+        return 0;
+    }
+
+    if (link->recv_packet_queue != NULL && listLength(link->recv_packet_queue) > 0) {
+        return 1;
+    }
+
+    clusterFinalizeReadCompletion(link);
+    return 0;
+}
+
 /* This function is called when we detect the link with this node is lost.
    We set the node as no longer connected. The Cluster Cron will detect
    this connection and will try to get it connected again.
@@ -4481,102 +4911,15 @@ void clusterLinkConnectHandler(connection *conn) {
     serverLog(LL_DEBUG, "Connecting with Node %.40s at %s:%d", node->name, node->ip, node->cport);
 }
 
-/* Performs sanity check on the message signature and length depending on the type. */
-static inline int isClusterMsgSignatureAndLengthValid(clusterMsgHeader *hdr) {
-    if (memcmp(hdr->sig, "RCmb", 4) != 0) return 0;
-    uint16_t type = ntohs(hdr->type);
-    uint32_t totlen = ntohl(hdr->totlen);
-    uint32_t minlen = IS_LIGHT_MESSAGE(type) ? CLUSTERMSG_LIGHT_MIN_LEN : CLUSTERMSG_MIN_LEN;
-    if (totlen < minlen) return 0;
-    return 1;
-}
-
-/* Read data. Try to read the first field of the header first to check the
- * full length of the packet. When a whole packet is in memory this function
- * will call the function to process the packet. And so forth. */
 void clusterReadHandler(connection *conn) {
-    clusterMsg buf[1];
-    ssize_t nread;
-    clusterMsgHeader *hdr;
     clusterLink *link = connGetPrivateData(conn);
-    unsigned int readlen, rcvbuflen;
+    if (trySendReadClusterToIOThreads(link) == C_OK) return;
+    if (link->io_read_state != CLIENT_IDLE || link->io_write_state != CLIENT_IDLE || link->recv_packet_queue ||
+        link->io_read_completion_pending)
+        return;
 
-    while (1) { /* Read as long as there is data to read. */
-        rcvbuflen = link->rcvbuf_len;
-        if (rcvbuflen < RCVBUF_MIN_READ_LEN) {
-            /* First, obtain the first 16 bytes to get the full message
-             * length and type. */
-            readlen = RCVBUF_MIN_READ_LEN - rcvbuflen;
-        } else {
-            /* Finally read the full message. */
-            hdr = (clusterMsgHeader *)link->rcvbuf;
-            if (rcvbuflen == RCVBUF_MIN_READ_LEN) {
-                /* Perform some sanity check on the message signature
-                 * and length. */
-                if (!isClusterMsgSignatureAndLengthValid(hdr)) {
-                    char ip[NET_IP_STR_LEN];
-                    int port;
-                    if (connAddrPeerName(conn, ip, sizeof(ip), &port) == -1) {
-                        serverLog(LL_WARNING, "Bad message length or signature received "
-                                              "on the Cluster bus.");
-                    } else {
-                        serverLog(LL_WARNING,
-                                  "Bad message length or signature received "
-                                  "on the Cluster bus from %s:%d",
-                                  ip, port);
-                    }
-                    handleLinkIOError(link);
-                    return;
-                }
-            }
-            readlen = ntohl(hdr->totlen) - rcvbuflen;
-            if (readlen > sizeof(buf)) readlen = sizeof(buf);
-        }
-
-        nread = connRead(conn, buf, readlen);
-        if (nread == -1 && (connGetState(conn) == CONN_STATE_CONNECTED)) return; /* No more data ready. */
-
-        if (nread <= 0) {
-            /* I/O error... */
-            serverLog(LL_DEBUG, "I/O error reading from node link (%.40s:%s) (%s): %s",
-                      clusterLinkGetNodeName(link),
-                      link->inbound ? "inbound" : "outbound",
-                      clusterLinkGetHumanNodeName(link),
-                      (nread == 0) ? "connection closed" : connGetLastError(conn));
-            handleLinkIOError(link);
-            return;
-        } else {
-            /* Read data and recast the pointer to the new buffer. */
-            size_t unused = link->rcvbuf_alloc - link->rcvbuf_len;
-            if ((size_t)nread > unused) {
-                size_t required = link->rcvbuf_len + nread;
-                size_t prev_rcvbuf_alloc = link->rcvbuf_alloc;
-                /* If less than 1mb, grow to twice the needed size, if larger grow by 1mb. */
-                link->rcvbuf_alloc = required < RCVBUF_MAX_PREALLOC ? required * 2 : required + RCVBUF_MAX_PREALLOC;
-                link->rcvbuf = zrealloc(link->rcvbuf, link->rcvbuf_alloc);
-                server.stat_cluster_links_memory += link->rcvbuf_alloc - prev_rcvbuf_alloc;
-            }
-            memcpy(link->rcvbuf + link->rcvbuf_len, buf, nread);
-            link->rcvbuf_len += nread;
-            hdr = (clusterMsgHeader *)link->rcvbuf;
-            rcvbuflen += nread;
-        }
-
-        /* Total length obtained? Process this packet. */
-        if (rcvbuflen >= RCVBUF_MIN_READ_LEN && rcvbuflen == ntohl(hdr->totlen)) {
-            if (clusterProcessPacket(link)) {
-                if (link->rcvbuf_alloc > RCVBUF_INIT_LEN) {
-                    size_t prev_rcvbuf_alloc = link->rcvbuf_alloc;
-                    zfree(link->rcvbuf);
-                    link->rcvbuf = zmalloc(link->rcvbuf_alloc = RCVBUF_INIT_LEN);
-                    server.stat_cluster_links_memory += link->rcvbuf_alloc - prev_rcvbuf_alloc;
-                }
-                link->rcvbuf_len = 0;
-            } else {
-                return; /* Link no longer valid. */
-            }
-        }
-    }
+    if (server.io_threads_num > 1) server.stat_cluster_io_read_fallbacks++;
+    clusterReadLinkSync(link);
 }
 
 /* Put the message block into the link's send queue.
@@ -5932,6 +6275,7 @@ static int clusterNodeCronHandleReconnect(clusterNode *node, mstime_t now, long 
         clusterLink *link = createClusterLink(node);
         link->conn = connCreate(connTypeOfCluster());
         connSetPrivateData(link->conn, link);
+        connSetPrivateDataOwner(link->conn, CONN_PRIVATE_DATA_CLUSTER_LINK, &link->io_read_state, &link->io_write_state);
         if (connConnect(link->conn, node->ip, node->cport, server.bind_source_addr, 0, clusterLinkConnectHandler) ==
             C_ERR) {
             /* We got a synchronous error from connect before

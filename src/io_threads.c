@@ -5,7 +5,11 @@
  */
 
 #include "io_threads.h"
+#include "cluster.h"
+#include "cluster_legacy.h"
+#include "connhelpers.h"
 #include "queues.h"
+#include <limits.h>
 #include <sys/resource.h>
 
 static _Thread_local int thread_id = 0;
@@ -44,9 +48,12 @@ static inline void untagJob(void *tagged_ptr, void **ptr, int *type) {
 /* Handler prototypes */
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
+void ioThreadReadClusterLink(clusterLink *link);
 void IOThreadFreeArgv(robj **argv);
 void IOThreadPoll(aeEventLoop *el);
 static void ioThreadAccept(client *c);
+
+extern int ProcessingEventsWhileBlocked;
 
 int inMainThread(void) {
     return thread_id == 0;
@@ -69,7 +76,7 @@ static size_t getPendingIOThreadsJobs(void) {
 
 /* Read/write jobs awaiting response from IO threads. */
 static int getPendingIOResponsesCount(void) {
-    return server.stat_io_writes_pending + server.stat_io_reads_pending;
+    return server.stat_io_writes_pending + server.stat_io_reads_pending + server.stat_cluster_io_reads_pending;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -361,6 +368,9 @@ static void *IOThreadMain(void *myid) {
             case JOB_REQ_ACCEPT:
                 ioThreadAccept((client *)data);
                 break;
+            case JOB_REQ_READ_CLUSTER:
+                ioThreadReadClusterLink((clusterLink *)data);
+                break;
             case JOB_REQ_POLL:
                 IOThreadPoll((aeEventLoop *)data);
                 break;
@@ -542,6 +552,38 @@ int trySendReadToIOThreads(client *c) {
     io_jobs_submitted++;
     server.stat_io_reads_pending++;
     c->flag.pending_read = 1;
+    return C_OK;
+}
+
+int trySendReadClusterToIOThreads(clusterLink *link) {
+    if (server.active_io_threads_num <= 1) return C_ERR;
+    if (link->io_read_state != CLIENT_IDLE) return C_OK;
+    if (link->io_write_state != CLIENT_IDLE) return C_ERR;
+    if (link->async_close || !link->conn || link->recv_packet_queue) return C_ERR;
+
+    link->io_result = CLUSTER_IO_OK;
+    link->io_nread = 0;
+    link->io_read_state = CLIENT_PENDING_IO;
+    connSetPostponeUpdateState(link->conn, 1);
+    connIncrRefs(link->conn);
+    link->io_refs++;
+
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_READ_CLUSTER)) == false)) {
+        serverAssert(link->io_refs > 0);
+        link->io_refs--;
+        link->io_read_state = CLIENT_IDLE;
+        connSetPostponeUpdateState(link->conn, 0);
+        connDecrRefs(link->conn);
+        if ((link->conn->flags & CONN_FLAG_CLOSE_SCHEDULED) && !connHasRefs(link->conn)) {
+            connClose(link->conn);
+            link->conn = NULL;
+        }
+        return C_ERR;
+    }
+
+    io_jobs_submitted++;
+    server.stat_cluster_io_reads_pending++;
+    server.stat_cluster_io_reads_offloaded++;
     return C_OK;
 }
 
@@ -810,6 +852,10 @@ int trySendAcceptToIOThreads(connection *conn) {
         return C_ERR;
     }
 
+    if (connGetPrivateDataType(conn) != CONN_PRIVATE_DATA_CLIENT) {
+        return C_ERR;
+    }
+
     client *c = connGetPrivateData(conn);
     if (c->io_read_state != CLIENT_IDLE) {
         return C_OK;
@@ -871,25 +917,30 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
 #define JOB_BATCH_SIZE (16)
 int processIOThreadsResponses(void) {
     /* We don't check for threads number  since some threads may return jobs then deactivate/shut-down */
+    if (pending_io_responses) flushPendingIOResponses(0);
 
     /* Quick check if any pending operations exist */
     if (getPendingIOResponsesCount() == 0) return 0;
 
     int total_processed = 0;
+    int response_limit = ProcessingEventsWhileBlocked ? 32 : INT_MAX;
     void *jobs[JOB_BATCH_SIZE];
     client *read_jobs[JOB_BATCH_SIZE];
     client *write_jobs[JOB_BATCH_SIZE];
+    clusterLink *cluster_read_jobs[JOB_BATCH_SIZE];
 
     /* Loop until we consume all pending jobs */
-    while (1) {
+    while (total_processed < response_limit) {
         int received_responses = 0;
         int dequeued_count = 0;
         int read_count = 0;
         int write_count = 0;
+        int cluster_read_count = 0;
+        int batch_limit = response_limit - total_processed;
+        if (batch_limit > JOB_BATCH_SIZE) batch_limit = JOB_BATCH_SIZE;
 
-        /* Try to dequeue JOB_BATCH_SIZE */
-        while (received_responses < JOB_BATCH_SIZE) {
-            dequeued_count = mpscDequeueBatch(&io_shared_outbox, jobs, JOB_BATCH_SIZE - received_responses);
+        while (received_responses < batch_limit) {
+            dequeued_count = mpscDequeueBatch(&io_shared_outbox, jobs, batch_limit - received_responses);
 
             /* Stop if we can't get more jobs from the queue. */
             if (dequeued_count == 0) break;
@@ -908,6 +959,9 @@ int processIOThreadsResponses(void) {
                 } else if (job_type == JOB_RES_WRITE_CLIENT) {
                     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                     write_jobs[write_count++] = c;
+                } else if (job_type == JOB_RES_READ_CLUSTER) {
+                    clusterLink *link = (clusterLink *)data;
+                    cluster_read_jobs[cluster_read_count++] = link;
                 } else {
                     serverPanic("Unknown job type %d", job_type);
                 }
@@ -916,8 +970,32 @@ int processIOThreadsResponses(void) {
 
         if (read_count) handleReadJobs(read_jobs, read_count);
         if (write_count) handleWriteJobs(write_jobs, write_count);
+        if (cluster_read_count) {
+            server.stat_cluster_io_reads_pending -= cluster_read_count;
+            serverAssert(server.stat_cluster_io_reads_pending >= 0);
+
+            for (int i = 0; i < cluster_read_count; i++) {
+                clusterLink *link = cluster_read_jobs[i];
+                int needs_continue = processClusterIOReadDone(link, ProcessingEventsWhileBlocked);
+                if (!needs_continue) continue;
+
+                server.stat_cluster_io_reads_pending++;
+                sendToMainThread(link, JOB_RES_READ_CLUSTER);
+                server.el_iteration_active = true;
+
+                if (ProcessingEventsWhileBlocked) {
+                    for (int j = i + 1; j < cluster_read_count; j++) {
+                        server.stat_cluster_io_reads_pending++;
+                        sendToMainThread(cluster_read_jobs[j], JOB_RES_READ_CLUSTER);
+                    }
+                    return total_processed;
+                }
+            }
+        }
 
         /* If the queue was empty at the last try - don't try again */
         if (dequeued_count == 0) return total_processed;
     }
+
+    return total_processed;
 }

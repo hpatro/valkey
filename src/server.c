@@ -1829,12 +1829,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         processed += connTypeProcessPendingData();
         if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
         processed += handleClientsWithPendingWrites();
-        int last_processed = 0;
-        do {
-            /* Try to process all the pending IO events. */
-            last_processed = processIOThreadsResponses();
-            processed += last_processed;
-        } while (last_processed != 0);
         processed += freeClientsInAsyncFreeQueue();
         server.events_processed_while_blocked += processed;
         return;
@@ -2787,6 +2781,11 @@ void resetServerStats(void) {
     server.stat_io_reads_processed = 0;
     server.stat_total_reads_processed = 0;
     server.stat_io_writes_processed = 0;
+    server.stat_cluster_io_reads_offloaded = 0;
+    server.stat_cluster_io_reads_pending = 0;
+    server.stat_cluster_io_read_fallbacks = 0;
+    server.stat_cluster_io_async_closed_links = 0;
+    server.stat_cluster_io_inbound_packets_queued = 0;
     server.stat_io_freed_objects = 0;
     server.stat_io_accept_offloaded = 0;
     server.stat_poll_processed_by_io_threads = 0;
@@ -6686,7 +6685,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_duration_max:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].max,
                 "eventloop_cmd_per_cycle_max:%lld\r\n", server.el_cmd_cnt_max,
                 "io_threaded_reads_pending:%lld\r\n", server.stat_io_reads_pending,
-                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending));
+                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending,
+                "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_io_reads_offloaded,
+                "cluster_io_reads_pending:%lld\r\n", server.stat_cluster_io_reads_pending,
+                "cluster_io_read_fallbacks:%lld\r\n", server.stat_cluster_io_read_fallbacks,
+                "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_io_async_closed_links,
+                "cluster_io_inbound_packets_queued:%lld\r\n", server.stat_cluster_io_inbound_packets_queued));
     }
 
     return info;

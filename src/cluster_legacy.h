@@ -28,6 +28,16 @@
 #define CLUSTER_TODO_BROADCAST_ALL (1 << 5)
 #define CLUSTER_TODO_HANDLE_SLOT_MIGRATION (1 << 6)
 
+typedef enum {
+    CLUSTER_IO_OK = 0,
+    CLUSTER_IO_EOF,
+    CLUSTER_IO_READ_ERROR,
+    CLUSTER_IO_WRITE_ERROR,
+    CLUSTER_IO_BAD_HEADER,
+    CLUSTER_IO_BAD_LENGTH,
+    CLUSTER_IO_ACCEPT_ERROR,
+} clusterIOResult;
+
 /* clusterLink encapsulates everything needed to talk with a remote node. */
 typedef struct clusterLink {
     mstime_t ctime;                        /* Link creation time */
@@ -38,10 +48,26 @@ typedef struct clusterLink {
     char *rcvbuf;                          /* Packet reception buffer */
     size_t rcvbuf_len;                     /* Used size of rcvbuf */
     size_t rcvbuf_alloc;                   /* Allocated size of rcvbuf */
+    size_t rcvbuf_mem_accounted;           /* Main-thread accounted rcvbuf allocation */
+    volatile uint8_t io_read_state;        /* Read offload state */
+    volatile uint8_t io_write_state;       /* Write offload state */
+    uint8_t async_close;                   /* Main-thread requested async close */
+    uint8_t io_refs;                       /* Number of in-flight I/O jobs */
+    uint8_t io_read_completion_pending;    /* Read completion still owns the link */
+    clusterIOResult io_result;             /* Result reported by the last I/O worker */
+    ssize_t io_nread;                      /* Bytes read by the last I/O worker */
+    ssize_t io_nwritten;                   /* Bytes written by the last I/O worker */
+    mstime_t last_io_read_time;            /* Last successful read completion time */
+    list *recv_packet_queue;               /* Framed packets awaiting main-thread apply */
+    list *send_msg_queue_pending;          /* Future pending queue for async writes */
+    list *send_msg_queue_inflight;         /* Future inflight queue for async writes */
+    size_t inflight_head_msg_send_offset;  /* Offset within the inflight head message */
     clusterNode *node;                     /* Node related to this link. Initialized to NULL when unknown */
     int inbound;                           /* 1 if this link is an inbound link accepted from the related node */
     int flags;                             /* CLUSTER_LINK_... */
 } clusterLink;
+
+int processClusterIOReadDone(clusterLink *link, int while_blocked);
 
 /* Cluster link flags and macros. */
 #define CLUSTER_LINK_EXTENSIONS_SUPPORTED (1 << 0) /* This link supports extensions. */
