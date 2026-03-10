@@ -129,7 +129,7 @@ int auxAnnounceClientTlsPortPresent(clusterNode *n);
 int auxAnnounceClientTlsPortPresent(clusterNode *n);
 static void clusterBuildMessageHdrLight(clusterMsgLight *hdr, int type, size_t msglen);
 static void clusterBuildMessageHdr(clusterMsg *hdr, int type, size_t msglen);
-void freeClusterLink(clusterLink *link);
+int freeClusterLink(clusterLink *link);
 int verifyClusterNodeId(const char *name, int length);
 sds clusterEncodeOpenSlotsAuxField(int rdbflags);
 int clusterDecodeOpenSlotsAuxField(int rdbflags, sds s);
@@ -1763,18 +1763,47 @@ clusterLink *createClusterLink(clusterNode *node) {
 
 /* Free a cluster link, but does not free the associated node of course.
  * This function will just make sure that the original node associated
- * with this link will have the 'link' field set to NULL. */
-void freeClusterLink(clusterLink *link) {
+ * with this link will have the 'link' field set to NULL.
+ *
+ * If I/O jobs are in flight (io_refs > 0), the link is not freed immediately.
+ * Instead, async_close is set, the link is detached from node fields, and the
+ * connection is closed (causing in-flight I/O to fail). The link object is
+ * freed later when the last completion decrements io_refs to 0.
+ *
+ * Returns 1 if the link was freed immediately, 0 if teardown was deferred. */
+int freeClusterLink(clusterLink *link) {
     serverAssert(link != NULL);
     serverLog(LL_DEBUG, "Freeing cluster link for node: %.40s:%s (%s)",
               clusterLinkGetNodeName(link),
               link->inbound ? "inbound" : "outbound",
               clusterLinkGetHumanNodeName(link));
 
+    /* Detach from node regardless of whether we free now or defer. */
+    if (link->node) {
+        if (link->node->link == link) {
+            serverAssert(!link->inbound);
+            link->node->link = NULL;
+        } else if (link->node->inbound_link == link) {
+            serverAssert(link->inbound);
+            link->node->inbound_link = NULL;
+            link->node->inbound_link_freed_time = mstime();
+        }
+        link->node = NULL;
+    }
+
+    /* Close the connection (causes in-flight I/O to fail). */
     if (link->conn) {
         connClose(link->conn);
         link->conn = NULL;
     }
+
+    /* If I/O jobs are in flight, defer the actual free. */
+    if (link->io_refs > 0) {
+        link->async_close = 1;
+        return 0;
+    }
+
+    /* Immediate free path. */
     server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue) * sizeof(listNode);
     listRelease(link->send_msg_queue);
 
@@ -1790,17 +1819,8 @@ void freeClusterLink(clusterLink *link) {
 
     server.stat_cluster_links_memory -= link->rcvbuf_alloc;
     zfree(link->rcvbuf);
-    if (link->node) {
-        if (link->node->link == link) {
-            serverAssert(!link->inbound);
-            link->node->link = NULL;
-        } else if (link->node->inbound_link == link) {
-            serverAssert(link->inbound);
-            link->node->inbound_link = NULL;
-            link->node->inbound_link_freed_time = mstime();
-        }
-    }
     zfree(link);
+    return 1;
 }
 
 void setClusterNodeToInboundClusterLink(clusterNode *node, clusterLink *link) {
