@@ -1829,12 +1829,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         processed += connTypeProcessPendingData();
         if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
         processed += handleClientsWithPendingWrites();
-        int last_processed = 0;
-        do {
-            /* Try to process all the pending IO events. */
-            last_processed = processIOThreadsResponses();
-            processed += last_processed;
-        } while (last_processed != 0);
         processed += freeClientsInAsyncFreeQueue();
         server.events_processed_while_blocked += processed;
         return;

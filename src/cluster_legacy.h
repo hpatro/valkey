@@ -59,11 +59,12 @@ typedef struct clusterLink {
     int inbound;                           /* 1 if this link is an inbound link accepted from the related node */
     int flags;                             /* CLUSTER_LINK_... */
 
-    /* Threaded I/O state (main-thread owned) */
+    /* Threaded I/O state (main-thread owned, except where noted) */
     int io_read_state;                     /* clusterLinkIOState: read job state */
     int io_write_state;                    /* clusterLinkIOState: write job state */
     int async_close;                       /* 1 if teardown requested while jobs in flight */
     int io_refs;                           /* Count of in-flight I/O jobs */
+    clusterIOResult io_result;             /* Result code from last I/O job (written by I/O thread) */
 
     /* Dual send queues for write offload */
     list *send_msg_queue_pending;          /* Main-thread appends here */
@@ -507,5 +508,13 @@ struct clusterState {
     /* Struct used for storing slot statistics, for all slots owned by the current shard. */
     slotStat slot_stats[CLUSTER_SLOTS];
 };
+
+/* Cluster I/O completion handlers called from processIOThreadsResponses().
+ * For read/write, the tagged pointer is the clusterLink* itself.
+ * For accept, the tagged pointer is the connection* (no clusterLink exists yet).
+ * Implemented in cluster_legacy.c. */
+void clusterHandleReadCompletion(clusterLink *link);
+void clusterHandleWriteCompletion(clusterLink *link);
+void clusterHandleAcceptCompletion(connection *conn);
 
 #endif // CLUSTER_LEGACY_H

@@ -8,6 +8,15 @@
 #include "queues.h"
 #include <sys/resource.h>
 
+/* Forward declarations for cluster I/O completion handling.
+ * For read/write completions, the tagged pointer is the clusterLink* itself.
+ * For accept completions, the tagged pointer is the connection*.
+ * The handler functions are implemented in cluster_legacy.c. */
+struct clusterLink;
+void clusterHandleReadCompletion(struct clusterLink *link);
+void clusterHandleWriteCompletion(struct clusterLink *link);
+void clusterHandleAcceptCompletion(connection *conn);
+
 static _Thread_local int thread_id = 0;
 static _Thread_local mpscTicket io_thread_ticket = {0};
 /* Backlog of responses when io_shared_outbox is full. Should be rare. */
@@ -28,7 +37,7 @@ _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
 /* Job Types for Tagged Pointers
  * We use the lower 3 bits of the pointer to store the job type.
- * Requires data pointers to be 8-byte aligned (standard for zmalloc/ptrs). */
+ * Requires data pointers to be 8-byte aligned (jemalloc with --with-lg-quantum=3). */
 #define JOB_TAG_MASK 0x7
 #define JOB_PTR_MASK (~(uintptr_t)JOB_TAG_MASK)
 
@@ -325,10 +334,10 @@ static void *IOThreadMain(void *myid) {
                 untagJob(batch_jobs[i], &data, &type);
 
                 switch (type) {
-                case JOB_REQ_FREE_ARGV:
+                case JOB_SPSC_FREE_ARGV:
                     IOThreadFreeArgv((robj **)data);
                     break;
-                case JOB_REQ_POLL:
+                case JOB_SPSC_POLL:
                     IOThreadPoll((aeEventLoop *)data);
                     break;
                 default:
@@ -674,7 +683,7 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
      * this is the last argument to free. With this approach, we don't need to
      * send the argc to the IO thread and we can send just the argv ptr. */
     argv[last_arg_to_free]->refcount = 0;
-    void *job = tagJob(argv, JOB_REQ_FREE_ARGV);
+    void *job = tagJob(argv, JOB_SPSC_FREE_ARGV);
     /* We pass false to enqueue the job without committing the queue index immediately.
      * This allows us to batch multiple free jobs together and
      * commit them in a single operation later in the event loop. This reduces the overhead
@@ -743,19 +752,19 @@ void trySendPollJobToIOThreads(void) {
         return;
     }
 
-    void *job = tagJob(server.el, JOB_REQ_POLL);
-
     server.io_poll_state = AE_IO_STATE_POLL;
     aeSetPollProtect(server.el, 1);
 
     /* Use SPMC to minimize polling overhead. At high thread counts, use private SPSC queues for lower latency. */
     if (server.active_io_threads_num <= 9) {
+        void *job = tagJob(server.el, JOB_REQ_POLL);
         if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) {
             server.io_poll_state = AE_IO_STATE_NONE;
             aeSetPollProtect(server.el, 0);
             return;
         }
     } else {
+        void *job = tagJob(server.el, JOB_SPSC_POLL);
         cur_epoll_thread = ((cur_epoll_thread) % (server.active_io_threads_num - 1)) + 1;
         if (unlikely(spscIsFull(&io_private_inbox[cur_epoll_thread]))) {
             server.io_poll_state = AE_IO_STATE_NONE;
@@ -872,9 +881,6 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
 int processIOThreadsResponses(void) {
     /* We don't check for threads number  since some threads may return jobs then deactivate/shut-down */
 
-    /* Quick check if any pending operations exist */
-    if (getPendingIOResponsesCount() == 0) return 0;
-
     int total_processed = 0;
     void *jobs[JOB_BATCH_SIZE];
     client *read_jobs[JOB_BATCH_SIZE];
@@ -901,13 +907,20 @@ int processIOThreadsResponses(void) {
                 void *data;
                 int job_type;
                 untagJob(jobs[i], &data, &job_type);
-                client *c = (client *)data;
                 if (job_type == JOB_RES_READ_CLIENT) {
+                    client *c = (client *)data;
                     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
                     read_jobs[read_count++] = c;
                 } else if (job_type == JOB_RES_WRITE_CLIENT) {
+                    client *c = (client *)data;
                     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                     write_jobs[write_count++] = c;
+                } else if (job_type == JOB_RES_CLUSTER_READ) {
+                    clusterHandleReadCompletion((struct clusterLink *)data);
+                } else if (job_type == JOB_RES_CLUSTER_WRITE) {
+                    clusterHandleWriteCompletion((struct clusterLink *)data);
+                } else if (job_type == JOB_RES_CLUSTER_ACCEPT) {
+                    clusterHandleAcceptCompletion((connection *)data);
                 } else {
                     serverPanic("Unknown job type %d", job_type);
                 }

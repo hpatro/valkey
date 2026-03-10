@@ -1733,6 +1733,7 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->io_write_state = CLUSTER_LINK_IO_IDLE;
     link->async_close = 0;
     link->io_refs = 0;
+    link->io_result = CLUSTER_IO_OK;
 
     /* Dual send queues for write offload */
     link->send_msg_queue_pending = listCreate();
@@ -8485,4 +8486,21 @@ bool isAnySlotInManualImportingState(void) {
 /* Returns if any slot has been put in MIGRATING state via SETSLOT command. */
 bool isAnySlotInManualMigratingState(void) {
     return dictSize(server.cluster->migrating_slots_to) > 0;
+}
+
+/* ===================== Cluster I/O Completion Handlers =====================
+ * These handlers are called from processIOThreadsResponses() when cluster
+ * I/O completions are dequeued from the response queue. The tagged pointer
+ * is the clusterLink* (read/write) or connection* (accept) directly. */
+
+void clusterHandleReadCompletion(clusterLink *link) {
+    UNUSED(link);
+}
+
+void clusterHandleWriteCompletion(clusterLink *link) {
+    UNUSED(link);
+}
+
+void clusterHandleAcceptCompletion(connection *conn) {
+    UNUSED(conn);
 }
