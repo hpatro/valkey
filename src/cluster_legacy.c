@@ -4440,6 +4440,41 @@ int clusterProcessPacket(clusterLink *link) {
     return 1;
 }
 
+/* Apply a single framed cluster packet from an explicit buffer.
+ *
+ * This is the main-thread-only entry point for processing packets produced
+ * by the framing layer (whether on an I/O thread or synchronously).
+ *
+ * Saves link->rcvbuf/rcvbuf_len, replaces them with buf/len, calls
+ * clusterProcessPacket(), then:
+ *   - If clusterProcessPacket() returns 1 (link still valid): restores
+ *     the saved rcvbuf/rcvbuf_len and returns 1.
+ *   - If clusterProcessPacket() returns 0 (link freed): the link object
+ *     no longer exists, so no restore is performed. Returns 0.
+ *
+ * The caller MUST treat a 0 return as "link is invalid" and not touch
+ * the link pointer afterward. */
+int clusterProcessPacketBuffer(clusterLink *link, char *buf, size_t len) {
+    /* Save the current rcvbuf state. */
+    char *saved_rcvbuf = link->rcvbuf;
+    size_t saved_rcvbuf_len = link->rcvbuf_len;
+
+    /* Temporarily replace rcvbuf with the explicit buffer. */
+    link->rcvbuf = buf;
+    link->rcvbuf_len = len;
+
+    int ret = clusterProcessPacket(link);
+
+    if (ret) {
+        /* Link is still valid — restore the original rcvbuf. */
+        link->rcvbuf = saved_rcvbuf;
+        link->rcvbuf_len = saved_rcvbuf_len;
+    }
+    /* If ret == 0, the link was freed by clusterProcessPacket.
+     * Do not touch the link pointer. */
+    return ret;
+}
+
 /* This function is called when we detect the link with this node is lost.
    We set the node as no longer connected. The Cluster Cron will detect
    this connection and will try to get it connected again.
@@ -4546,6 +4581,78 @@ static inline int isClusterMsgSignatureAndLengthValid(clusterMsgHeader *hdr) {
     uint32_t minlen = IS_LIGHT_MESSAGE(type) ? CLUSTERMSG_LIGHT_MIN_LEN : CLUSTERMSG_MIN_LEN;
     if (totlen < minlen) return 0;
     return 1;
+}
+
+/* Framing bounds for clusterFramePackets. */
+#define CLUSTER_FRAME_MAX_PACKETS 16
+#define CLUSTER_FRAME_MAX_BYTES (64 * 1024) /* 64 KB */
+
+/* Frame packets from raw bytes in rcvbuf.
+ *
+ * Scans the buffer for complete cluster messages by validating the signature
+ * ("RCmb"), minimum header length, and total length field. Stops at max_packets
+ * or max_bytes, whichever limit is reached first.
+ *
+ * For each complete packet found, a copy of the packet bytes is allocated and
+ * appended to framed_packets. The caller is responsible for freeing these buffers.
+ *
+ * Thread-safe: reads only from the provided buffer, writes only to the output
+ * list and consumed/result output parameters. Does not touch clusterNode,
+ * clusterState, or any main-thread structure.
+ *
+ * Returns the number of packets framed. */
+int clusterFramePackets(char *rcvbuf,
+                        size_t rcvbuf_len,
+                        size_t *consumed,
+                        list *framed_packets,
+                        int max_packets,
+                        size_t max_bytes,
+                        clusterIOResult *result) {
+    size_t offset = 0;
+    int packets = 0;
+    size_t bytes_framed = 0;
+
+    *consumed = 0;
+    *result = CLUSTER_IO_OK;
+
+    while (offset < rcvbuf_len && packets < max_packets && bytes_framed < max_bytes) {
+        size_t remaining = rcvbuf_len - offset;
+
+        /* Need at least the header to determine message length. */
+        if (remaining < RCVBUF_MIN_READ_LEN) break;
+
+        clusterMsgHeader *hdr = (clusterMsgHeader *)(rcvbuf + offset);
+
+        /* Validate signature and minimum length. */
+        if (memcmp(hdr->sig, "RCmb", 4) != 0) {
+            *result = CLUSTER_IO_BAD_HEADER;
+            return packets;
+        }
+
+        uint32_t totlen = ntohl(hdr->totlen);
+        uint16_t type = ntohs(hdr->type);
+        uint32_t minlen = IS_LIGHT_MESSAGE(type) ? CLUSTERMSG_LIGHT_MIN_LEN : CLUSTERMSG_MIN_LEN;
+
+        if (totlen < minlen) {
+            *result = CLUSTER_IO_BAD_LENGTH;
+            return packets;
+        }
+
+        /* Wait for the full message to arrive. */
+        if (remaining < totlen) break;
+
+        /* Copy the packet into a standalone buffer and append to the output list. */
+        char *pkt = zmalloc(totlen);
+        memcpy(pkt, rcvbuf + offset, totlen);
+        listAddNodeTail(framed_packets, pkt);
+
+        offset += totlen;
+        bytes_framed += totlen;
+        packets++;
+    }
+
+    *consumed = offset;
+    return packets;
 }
 
 /* Read data. Try to read the first field of the header first to check the
