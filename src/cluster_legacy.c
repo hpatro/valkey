@@ -1818,6 +1818,7 @@ static void clusterConnAcceptHandler(connection *conn) {
     link = createClusterLink(NULL);
     link->conn = conn;
     connSetPrivateData(conn, link);
+    connSetOwnerKind(conn, CONN_OWNER_CLUSTER_LINK);
 
     /* Register read handler */
     connSetReadHandler(conn, clusterReadHandler);
@@ -5935,6 +5936,7 @@ static int clusterNodeCronHandleReconnect(clusterNode *node, mstime_t now, long 
         clusterLink *link = createClusterLink(node);
         link->conn = connCreate(connTypeOfCluster());
         connSetPrivateData(link->conn, link);
+        connSetOwnerKind(link->conn, CONN_OWNER_CLUSTER_LINK);
         if (connConnect(link->conn, node->ip, node->cport, server.bind_source_addr, 0, clusterLinkConnectHandler) ==
             C_ERR) {
             /* We got a synchronous error from connect before
