@@ -1727,6 +1727,28 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->send_msg_queue_mem = sizeof(list);
     link->rcvbuf = zmalloc(link->rcvbuf_alloc = RCVBUF_INIT_LEN);
     link->rcvbuf_len = 0;
+
+    /* Threaded I/O state */
+    link->io_read_state = CLUSTER_LINK_IO_IDLE;
+    link->io_write_state = CLUSTER_LINK_IO_IDLE;
+    link->async_close = 0;
+    link->io_refs = 0;
+
+    /* Dual send queues for write offload */
+    link->send_msg_queue_pending = listCreate();
+    listSetFreeMethod(link->send_msg_queue_pending, clusterMsgSendBlockDecrRefCount);
+    link->send_msg_queue_inflight = listCreate();
+    listSetFreeMethod(link->send_msg_queue_inflight, clusterMsgSendBlockDecrRefCount);
+    link->inflight_send_offset = 0;
+    link->send_msg_queue_mem += sizeof(list) + sizeof(list); /* Track both new lists */
+
+    /* Failure detection timestamp */
+    atomic_store_explicit(&link->last_io_read_time, 0, memory_order_relaxed);
+
+    /* Framed packet queue */
+    link->framed_packets = listCreate();
+    link->framed_packets_mem = 0;
+
     server.stat_cluster_links_memory += link->rcvbuf_alloc + link->send_msg_queue_mem;
     link->conn = NULL;
     link->node = node;
@@ -1755,6 +1777,17 @@ void freeClusterLink(clusterLink *link) {
     }
     server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue) * sizeof(listNode);
     listRelease(link->send_msg_queue);
+
+    /* Clean up dual send queues */
+    server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue_pending) * sizeof(listNode);
+    listRelease(link->send_msg_queue_pending);
+    server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue_inflight) * sizeof(listNode);
+    listRelease(link->send_msg_queue_inflight);
+
+    /* Clean up framed packets */
+    server.stat_cluster_links_memory -= link->framed_packets_mem;
+    listRelease(link->framed_packets);
+
     server.stat_cluster_links_memory -= link->rcvbuf_alloc;
     zfree(link->rcvbuf);
     if (link->node) {

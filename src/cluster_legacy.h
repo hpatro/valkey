@@ -28,6 +28,23 @@
 #define CLUSTER_TODO_BROADCAST_ALL (1 << 5)
 #define CLUSTER_TODO_HANDLE_SLOT_MIGRATION (1 << 6)
 
+/* I/O state for threaded cluster bus offload. */
+typedef enum {
+    CLUSTER_LINK_IO_IDLE = 0,
+    CLUSTER_LINK_IO_PENDING,
+} clusterLinkIOState;
+
+/* Result codes for cluster I/O jobs. */
+typedef enum {
+    CLUSTER_IO_OK = 0,
+    CLUSTER_IO_BAD_HEADER,
+    CLUSTER_IO_BAD_LENGTH,
+    CLUSTER_IO_READ_ERROR,
+    CLUSTER_IO_EOF,
+    CLUSTER_IO_WRITE_ERROR,
+    CLUSTER_IO_ACCEPT_ERROR,
+} clusterIOResult;
+
 /* clusterLink encapsulates everything needed to talk with a remote node. */
 typedef struct clusterLink {
     mstime_t ctime;                        /* Link creation time */
@@ -41,6 +58,24 @@ typedef struct clusterLink {
     clusterNode *node;                     /* Node related to this link. Initialized to NULL when unknown */
     int inbound;                           /* 1 if this link is an inbound link accepted from the related node */
     int flags;                             /* CLUSTER_LINK_... */
+
+    /* Threaded I/O state (main-thread owned) */
+    int io_read_state;                     /* clusterLinkIOState: read job state */
+    int io_write_state;                    /* clusterLinkIOState: write job state */
+    int async_close;                       /* 1 if teardown requested while jobs in flight */
+    int io_refs;                           /* Count of in-flight I/O jobs */
+
+    /* Dual send queues for write offload */
+    list *send_msg_queue_pending;          /* Main-thread appends here */
+    list *send_msg_queue_inflight;         /* Frozen for one write job */
+    size_t inflight_send_offset;           /* Byte offset into head of inflight queue */
+
+    /* Timestamp for failure detection (cross-thread) */
+    _Atomic mstime_t last_io_read_time;    /* Updated by I/O thread on successful read */
+
+    /* Framed packet queue for read offload */
+    list *framed_packets;                  /* List of framed packet buffers */
+    size_t framed_packets_mem;             /* Memory in bytes used by framed_packets */
 } clusterLink;
 
 /* Cluster link flags and macros. */
