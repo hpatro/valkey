@@ -1741,13 +1741,11 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->io_result = CLUSTER_IO_OK;
 
     /* Dual send queues for write offload */
-    link->send_msg_queue_pending = listCreate();
-    listSetFreeMethod(link->send_msg_queue_pending, clusterMsgSendBlockDecrRefCount);
     link->send_msg_queue_inflight = listCreate();
     listSetFreeMethod(link->send_msg_queue_inflight, clusterMsgSendBlockDecrRefCount);
     link->inflight_send_offset = 0;
     link->inflight_nodes_sent = 0;
-    link->send_msg_queue_mem += sizeof(list) + sizeof(list); /* Track both new lists */
+    link->send_msg_queue_mem += sizeof(list); /* Track inflight list */
 
     /* Failure detection timestamp */
     atomic_store_explicit(&link->last_io_read_time, 0, memory_order_relaxed);
@@ -1819,8 +1817,6 @@ int freeClusterLink(clusterLink *link) {
     listRelease(link->send_msg_queue);
 
     /* Clean up dual send queues */
-    server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue_pending) * sizeof(listNode);
-    listRelease(link->send_msg_queue_pending);
     server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue_inflight) * sizeof(listNode);
     listRelease(link->send_msg_queue_inflight);
 

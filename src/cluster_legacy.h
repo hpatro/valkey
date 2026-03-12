@@ -67,7 +67,6 @@ typedef struct clusterLink {
     clusterIOResult io_result;             /* Result code from last I/O job (written by I/O thread) */
 
     /* Dual send queues for write offload */
-    list *send_msg_queue_pending;          /* Main-thread appends here */
     list *send_msg_queue_inflight;         /* Frozen for one write job */
     size_t inflight_send_offset;           /* Byte offset into head of inflight queue */
     int inflight_nodes_sent;               /* Number of fully-sent nodes (set by I/O thread) */
