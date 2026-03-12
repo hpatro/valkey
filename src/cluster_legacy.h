@@ -516,5 +516,6 @@ struct clusterState {
 void clusterHandleReadCompletion(clusterLink *link);
 void clusterHandleWriteCompletion(clusterLink *link);
 void clusterHandleAcceptCompletion(connection *conn);
+void clusterReadJob(clusterLink *link);
 
 #endif // CLUSTER_LEGACY_H

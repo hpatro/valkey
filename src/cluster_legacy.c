@@ -44,6 +44,7 @@
 #include "endianconv.h"
 #include "connection.h"
 #include "module.h"
+#include "io_threads.h"
 
 #include <stdlib.h>
 #include <sys/types.h>
@@ -8486,6 +8487,85 @@ bool isAnySlotInManualImportingState(void) {
 /* Returns if any slot has been put in MIGRATING state via SETSLOT command. */
 bool isAnySlotInManualMigratingState(void) {
     return dictSize(server.cluster->migrating_slots_to) > 0;
+}
+
+/* ===================== Cluster I/O Thread Worker Functions ==================
+ * These run on I/O threads. They must NOT touch clusterNode, clusterState,
+ * server.stat_cluster_links_memory, or any main-thread-only structure. */
+
+/* I/O thread worker: read bytes from a cluster link's connection, grow the
+ * receive buffer as needed, frame packets, and post a completion.
+ *
+ * Buffer growth follows the same logic as clusterReadHandler:
+ *   - If < 1 MB, grow to twice the required size.
+ *   - If >= 1 MB, grow by 1 MB.
+ * stat_cluster_links_memory adjustment is deferred to the main-thread
+ * completion handler. */
+void clusterReadJob(clusterLink *link) {
+    connection *conn = link->conn;
+    clusterIOResult result = CLUSTER_IO_OK;
+    ssize_t total_read = 0;
+
+    /* Read loop: pull as many bytes as the kernel has ready. */
+    while (1) {
+        /* Ensure at least some space in rcvbuf. */
+        if (link->rcvbuf_len == link->rcvbuf_alloc) {
+            size_t required = link->rcvbuf_alloc + 1;
+            link->rcvbuf_alloc = required < RCVBUF_MAX_PREALLOC ? required * 2 : required + RCVBUF_MAX_PREALLOC;
+            link->rcvbuf = zrealloc(link->rcvbuf, link->rcvbuf_alloc);
+        }
+
+        size_t avail = link->rcvbuf_alloc - link->rcvbuf_len;
+        ssize_t nread = connRead(conn, link->rcvbuf + link->rcvbuf_len, avail);
+
+        if (nread > 0) {
+            link->rcvbuf_len += nread;
+            total_read += nread;
+            continue;
+        }
+
+        if (nread == 0) {
+            /* EOF */
+            result = CLUSTER_IO_EOF;
+            break;
+        }
+
+        /* nread == -1 */
+        if (connGetState(conn) == CONN_STATE_CONNECTED) {
+            /* EAGAIN — no more data right now, that's fine. */
+            break;
+        }
+        /* Real read error. */
+        result = CLUSTER_IO_READ_ERROR;
+        break;
+    }
+
+    /* If we read something, frame packets and update the read timestamp. */
+    if (total_read > 0) {
+        size_t consumed = 0;
+        clusterIOResult frame_result;
+        clusterFramePackets(link->rcvbuf, link->rcvbuf_len, &consumed,
+                            link->framed_packets, 16, 65536, &frame_result);
+
+        /* Compact the receive buffer and track framed packet memory. */
+        if (consumed > 0) {
+            link->framed_packets_mem = consumed;
+            memmove(link->rcvbuf, link->rcvbuf + consumed, link->rcvbuf_len - consumed);
+            link->rcvbuf_len -= consumed;
+        }
+
+        /* If framing found a protocol error, that takes priority. */
+        if (frame_result != CLUSTER_IO_OK) {
+            result = frame_result;
+        }
+
+        /* Record when we last successfully read bytes (wall-clock ms). */
+        atomic_store_explicit(&link->last_io_read_time, mstime(), memory_order_release);
+    }
+
+    /* Post result and completion to the main thread. */
+    link->io_result = result;
+    sendToMainThread(link, JOB_RES_CLUSTER_READ);
 }
 
 /* ===================== Cluster I/O Completion Handlers =====================
