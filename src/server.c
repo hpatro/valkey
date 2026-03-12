@@ -2808,6 +2808,10 @@ void resetServerStats(void) {
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
     server.stat_reply_buffer_shrinks = 0;
+    server.stat_cluster_reads_offloaded = 0;
+    server.stat_cluster_io_sync_fallbacks = 0;
+    server.stat_cluster_async_closed_links = 0;
+    server.stat_cluster_queued_inbound_packets = 0;
     server.stat_reply_buffer_expands = 0;
     memset(server.duration_stats, 0, sizeof(durationStats) * EL_DURATION_TYPE_NUM);
     server.el_cmd_cnt_max = 0;
@@ -3006,6 +3010,10 @@ void initServer(void) {
     server.stat_module_progress = 0;
     for (int j = 0; j < CLIENT_TYPE_COUNT; j++) server.stat_clients_type_memory[j] = 0;
     server.stat_cluster_links_memory = 0;
+    server.stat_cluster_reads_offloaded = 0;
+    server.stat_cluster_io_sync_fallbacks = 0;
+    server.stat_cluster_async_closed_links = 0;
+    server.stat_cluster_queued_inbound_packets = 0;
     server.cron_malloc_stats.zmalloc_used = 0;
     server.cron_malloc_stats.process_rss = 0;
     server.cron_malloc_stats.allocator_allocated = 0;
@@ -6399,6 +6407,10 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
+                "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_reads_offloaded,
+                "cluster_io_sync_fallbacks:%lld\r\n", server.stat_cluster_io_sync_fallbacks,
+                "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_async_closed_links,
+                "cluster_io_queued_inbound_packets:%lld\r\n", server.stat_cluster_queued_inbound_packets,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,

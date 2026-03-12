@@ -627,7 +627,10 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
 
     /* No I/O thread pool available — synchronous fallback. */
-    if (server.active_io_threads_num <= 1) return C_ERR;
+    if (server.active_io_threads_num <= 1) {
+        server.stat_cluster_io_sync_fallbacks++;
+        return C_ERR;
+    }
 
     /* Postpone connection state updates while the I/O thread operates. */
     connSetPostponeUpdateState(link->conn, 1);
@@ -643,10 +646,12 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
         link->io_read_state = CLUSTER_LINK_IO_IDLE;
         link->io_refs--;
         connSetPostponeUpdateState(link->conn, 0);
+        server.stat_cluster_io_sync_fallbacks++;
         return C_ERR;
     }
 
     io_jobs_submitted++;
+    server.stat_cluster_reads_offloaded++;
     return C_OK;
 }
 

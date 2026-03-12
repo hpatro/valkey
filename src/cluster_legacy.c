@@ -1805,6 +1805,7 @@ int freeClusterLink(clusterLink *link) {
     /* If I/O jobs are in flight, defer the actual free. */
     if (link->io_refs > 0) {
         link->async_close = 1;
+        server.stat_cluster_async_closed_links++;
         return 0;
     }
 
@@ -8601,6 +8602,7 @@ void clusterHandleReadCompletion(clusterLink *link) {
      * framed_packets_mem tracks packet buffer sizes only (not list node overhead),
      * consistent with freeClusterLink's accounting. */
     server.stat_cluster_links_memory += link->framed_packets_mem;
+    server.stat_cluster_queued_inbound_packets += listLength(link->framed_packets);
 
     /* If the link was already marked for async close, check if we can
      * perform the final free now that io_refs has been decremented. */
@@ -8608,6 +8610,7 @@ void clusterHandleReadCompletion(clusterLink *link) {
         if (link->io_refs == 0) {
             /* Subtract framed_packets_mem we just added, then free packets. */
             server.stat_cluster_links_memory -= link->framed_packets_mem;
+            server.stat_cluster_queued_inbound_packets -= listLength(link->framed_packets);
             listNode *ln;
             while ((ln = listFirst(link->framed_packets)) != NULL) {
                 zfree(ln->value);
@@ -8668,6 +8671,7 @@ void clusterHandleReadCompletion(clusterLink *link) {
         int ret = clusterProcessPacketBuffer(link, pkt, totlen);
         zfree(pkt);
         applied++;
+        server.stat_cluster_queued_inbound_packets--;
 
         if (!ret) {
             /* Link was freed by clusterProcessPacket — stop immediately. */
