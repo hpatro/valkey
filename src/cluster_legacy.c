@@ -1745,7 +1745,6 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->send_msg_queue_inflight = listCreate();
     listSetFreeMethod(link->send_msg_queue_inflight, clusterMsgSendBlockDecrRefCount);
     link->inflight_send_offset = 0;
-    link->inflight_bytes_sent = 0;
     link->inflight_nodes_sent = 0;
     link->send_msg_queue_mem += sizeof(list) + sizeof(list); /* Track both new lists */
 
@@ -8607,18 +8606,21 @@ void clusterReadJob(clusterLink *link) {
 /* I/O thread worker: write bytes from the inflight send queue to the
  * connection, starting at inflight_send_offset.
  *
- * Must NOT touch clusterNode, clusterState, server.stat_cluster_links_memory,
- * or any main-thread-only structure. Memory accounting updates are deferred
- * to the main-thread completion handler. */
+ * The worker iterates through the inflight list and writes bytes, but
+ * does NOT pop nodes or decrement refcounts — clusterMsgSendBlock
+ * refcounts are non-atomic and blocks can be shared across links.
+ * The worker records how many nodes were fully sent (inflight_nodes_sent)
+ * and the byte offset into the next partially-sent node
+ * (inflight_send_offset). The main-thread completion handler uses
+ * these to pop nodes and update memory accounting. */
 void clusterWriteJob(clusterLink *link) {
     connection *conn = link->conn;
     clusterIOResult result = CLUSTER_IO_OK;
-    size_t bytes_sent = 0; /* Total block bytes of fully-sent nodes */
-    int nodes_popped = 0;
+    int nodes_sent = 0;
+    listNode *node = listFirst(link->send_msg_queue_inflight);
 
-    while (listLength(link->send_msg_queue_inflight) > 0) {
-        listNode *head = listFirst(link->send_msg_queue_inflight);
-        clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
+    while (node) {
+        clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)node->value;
         clusterMsg *msg = &msgblock->data[0].msg;
         size_t msg_len = ntohl(msg->totlen);
         size_t msg_offset = link->inflight_send_offset;
@@ -8626,8 +8628,7 @@ void clusterWriteJob(clusterLink *link) {
         ssize_t nwritten = connWrite(conn, (char *)msg + msg_offset, msg_len - msg_offset);
         if (nwritten <= 0) {
             if (nwritten == -1 && connGetState(conn) == CONN_STATE_CONNECTED) {
-                /* EAGAIN — kernel buffer full, stop for now. */
-                break;
+                break; /* EAGAIN */
             }
             result = CLUSTER_IO_WRITE_ERROR;
             break;
@@ -8635,21 +8636,16 @@ void clusterWriteJob(clusterLink *link) {
 
         link->inflight_send_offset += nwritten;
         if (link->inflight_send_offset < msg_len) {
-            /* Partial write — stop, completion handler will reschedule. */
-            break;
+            break; /* Partial write */
         }
 
-        /* Fully sent this message node — pop and track for memory accounting. */
+        /* Fully sent this message — advance to next. */
         link->inflight_send_offset = 0;
-        bytes_sent += msgblock->totlen;
-        nodes_popped++;
-        listDelNode(link->send_msg_queue_inflight, head);
+        nodes_sent++;
+        node = listNextNode(node);
     }
 
-    /* Store accounting data for the main-thread completion handler. */
-    link->inflight_bytes_sent = bytes_sent;
-    link->inflight_nodes_sent = nodes_popped;
-
+    link->inflight_nodes_sent = nodes_sent;
     link->io_result = result;
     sendToMainThread(link, JOB_RES_CLUSTER_WRITE);
 }
@@ -8782,15 +8778,18 @@ void clusterHandleWriteCompletion(clusterLink *link) {
     link->io_write_state = CLUSTER_LINK_IO_IDLE;
     link->io_refs--;
 
-    /* Update memory accounting for nodes popped by the I/O thread.
-     * Each popped node contributes sizeof(listNode) + msgblock->totlen
-     * to send_msg_queue_mem and sizeof(listNode) to stat_cluster_links_memory. */
-    if (link->inflight_bytes_sent > 0 || link->inflight_nodes_sent > 0) {
-        size_t listnode_mem = (size_t)link->inflight_nodes_sent * sizeof(listNode);
-        link->send_msg_queue_mem -= link->inflight_bytes_sent + listnode_mem;
-        server.stat_cluster_links_memory -= listnode_mem;
-        link->inflight_bytes_sent = 0;
-        link->inflight_nodes_sent = 0;
+    /* Pop fully-sent nodes from the inflight queue. The I/O thread recorded
+     * how many nodes it fully sent (inflight_nodes_sent) without modifying
+     * the list. We pop them here on the main thread where refcount
+     * decrements and memory accounting are safe. */
+    for (int i = 0; i < link->inflight_nodes_sent; i++) {
+        listNode *head = listFirst(link->send_msg_queue_inflight);
+        serverAssert(head != NULL);
+        clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
+        uint32_t blocklen = msgblock->totlen;
+        listDelNode(link->send_msg_queue_inflight, head);
+        link->send_msg_queue_mem -= sizeof(listNode) + blocklen;
+        server.stat_cluster_links_memory -= sizeof(listNode);
     }
 
     /* If the link was already marked for async close, check if we can

@@ -70,8 +70,7 @@ typedef struct clusterLink {
     list *send_msg_queue_pending;          /* Main-thread appends here */
     list *send_msg_queue_inflight;         /* Frozen for one write job */
     size_t inflight_send_offset;           /* Byte offset into head of inflight queue */
-    size_t inflight_bytes_sent;            /* Total block bytes of fully-sent nodes (set by I/O thread) */
-    int inflight_nodes_sent;               /* Number of fully-sent nodes popped (set by I/O thread) */
+    int inflight_nodes_sent;               /* Number of fully-sent nodes (set by I/O thread) */
 
     /* Timestamp for failure detection (cross-thread) */
     _Atomic mstime_t last_io_read_time;    /* Updated by I/O thread on successful read */

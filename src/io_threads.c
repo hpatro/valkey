@@ -694,6 +694,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
     link->send_msg_queue_inflight = link->send_msg_queue;
     link->send_msg_queue = tmp;
     link->inflight_send_offset = 0;
+    link->inflight_nodes_sent = 0;
 
     /* Transition link to pending-write state. */
     link->io_write_state = CLUSTER_LINK_IO_PENDING;
