@@ -1746,6 +1746,7 @@ clusterLink *createClusterLink(clusterNode *node) {
     listSetFreeMethod(link->send_msg_queue_inflight, clusterMsgSendBlockDecrRefCount);
     link->inflight_send_offset = 0;
     link->inflight_bytes_sent = 0;
+    link->inflight_nodes_sent = 0;
     link->send_msg_queue_mem += sizeof(list) + sizeof(list); /* Track both new lists */
 
     /* Failure detection timestamp */
@@ -8628,6 +8629,7 @@ void clusterWriteJob(clusterLink *link) {
 
     /* Store accounting data for the main-thread completion handler. */
     link->inflight_bytes_sent = bytes_sent;
+    link->inflight_nodes_sent = nodes_popped;
 
     link->io_result = result;
     sendToMainThread(link, JOB_RES_CLUSTER_WRITE);
@@ -8742,7 +8744,54 @@ void clusterHandleReadCompletion(clusterLink *link) {
 }
 
 void clusterHandleWriteCompletion(clusterLink *link) {
-    UNUSED(link);
+    connection *conn = link->conn;
+
+    /* Apply deferred connection state transitions. */
+    if (conn) {
+        connSetPostponeUpdateState(conn, 0);
+        connUpdateState(conn);
+    }
+
+    /* Transition back to idle and release the I/O ref. */
+    link->io_write_state = CLUSTER_LINK_IO_IDLE;
+    link->io_refs--;
+
+    /* Update memory accounting for nodes popped by the I/O thread.
+     * Each popped node contributes sizeof(listNode) + msgblock->totlen
+     * to send_msg_queue_mem and sizeof(listNode) to stat_cluster_links_memory. */
+    if (link->inflight_bytes_sent > 0 || link->inflight_nodes_sent > 0) {
+        size_t listnode_mem = (size_t)link->inflight_nodes_sent * sizeof(listNode);
+        link->send_msg_queue_mem -= link->inflight_bytes_sent + listnode_mem;
+        server.stat_cluster_links_memory -= listnode_mem;
+        link->inflight_bytes_sent = 0;
+        link->inflight_nodes_sent = 0;
+    }
+
+    /* If the link was already marked for async close, check if we can
+     * perform the final free now that io_refs has been decremented. */
+    if (link->async_close) {
+        if (link->io_refs == 0) {
+            freeClusterLink(link);
+        }
+        return;
+    }
+
+    clusterIOResult result = link->io_result;
+
+    /* Handle write error: log and tear down the link. */
+    if (result == CLUSTER_IO_WRITE_ERROR) {
+        serverLog(LL_DEBUG, "I/O error writing to node link (%.40s:%s) (%s)",
+                  clusterLinkGetNodeName(link),
+                  link->inbound ? "inbound" : "outbound",
+                  clusterLinkGetHumanNodeName(link));
+        freeClusterLink(link);
+        return;
+    }
+
+    /* Reschedule a write job if data remains in inflight or pending queues. */
+    if (listLength(link->send_msg_queue_inflight) > 0 || listLength(link->send_msg_queue_pending) > 0) {
+        trySendClusterWriteToIOThreads(link);
+    }
 }
 
 void clusterHandleAcceptCompletion(connection *conn) {
