@@ -8645,6 +8645,13 @@ void clusterWriteJob(clusterLink *link) {
     sendToMainThread(link, JOB_RES_CLUSTER_WRITE);
 }
 
+/* I/O thread worker: perform TLS accept handshake on a cluster connection.
+ * No clusterLink exists yet — it is created by the main thread on success. */
+void clusterAcceptJob(connection *conn) {
+    connAccept(conn, NULL);
+    sendToMainThread(conn, JOB_RES_CLUSTER_ACCEPT);
+}
+
 /* ===================== Cluster I/O Completion Handlers =====================
  * These handlers are called from processIOThreadsResponses() when cluster
  * I/O completions are dequeued from the response queue. The tagged pointer
@@ -8818,5 +8825,20 @@ void clusterHandleWriteCompletion(clusterLink *link) {
 }
 
 void clusterHandleAcceptCompletion(connection *conn) {
-    UNUSED(conn);
+    connSetPostponeUpdateState(conn, 0);
+    connUpdateState(conn);
+
+    if (connGetState(conn) != CONN_STATE_CONNECTED) {
+        serverLog(LL_VERBOSE, "Error accepting cluster node connection: %s", connGetLastError(conn));
+        connClose(conn);
+        return;
+    }
+
+    /* Accept succeeded — create the clusterLink and install the read handler.
+     * This mirrors clusterConnAcceptHandler. */
+    clusterLink *link = createClusterLink(NULL);
+    link->conn = conn;
+    connSetPrivateData(conn, link);
+    connSetOwnerKind(conn, CONN_OWNER_CLUSTER_LINK);
+    connSetReadHandler(conn, clusterReadOffloadHandler);
 }
