@@ -67,6 +67,7 @@ clusterNode *createClusterNode(char *nodename, int flags);
 void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterReadHandler(connection *conn);
+static void clusterReadOffloadHandler(connection *conn);
 void clusterSendPing(clusterLink *link, int type);
 void clusterSendFail(char *nodename);
 void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request);
@@ -1880,7 +1881,7 @@ static void clusterConnAcceptHandler(connection *conn) {
     connSetOwnerKind(conn, CONN_OWNER_CLUSTER_LINK);
 
     /* Register read handler */
-    connSetReadHandler(conn, clusterReadHandler);
+    connSetReadHandler(conn, clusterReadOffloadHandler);
 }
 
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -4548,7 +4549,7 @@ void clusterLinkConnectHandler(connection *conn) {
     }
 
     /* Register a read handler from now on */
-    connSetReadHandler(conn, clusterReadHandler);
+    connSetReadHandler(conn, clusterReadOffloadHandler);
 
     /* Queue a PING in the new connection ASAP: this is crucial
      * to avoid false positives in failure detection.
@@ -4659,6 +4660,16 @@ int clusterFramePackets(char *rcvbuf,
 
     *consumed = offset;
     return packets;
+}
+
+/* Cluster readable event handler: try to offload the read to an I/O thread.
+ * If offload is unavailable (pool inactive, queue full), fall back to the
+ * synchronous clusterReadHandler. */
+static void clusterReadOffloadHandler(connection *conn) {
+    clusterLink *link = connGetPrivateData(conn);
+    if (trySendClusterReadToIOThreads(link) == C_ERR) {
+        clusterReadHandler(conn);
+    }
 }
 
 /* Read data. Try to read the first field of the header first to check the
