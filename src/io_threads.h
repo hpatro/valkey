@@ -55,6 +55,7 @@ void trySendPollJobToIOThreads(void);
 int trySendAcceptToIOThreads(connection *conn);
 struct clusterLink;
 int trySendClusterReadToIOThreads(struct clusterLink *link);
+int trySendClusterWriteToIOThreads(struct clusterLink *link);
 int updateIOThreads(const char **err);
 long long getIOThreadActiveTimeMicroseconds(int id);
 int clientHasPendingIO(struct client *c);

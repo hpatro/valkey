@@ -655,6 +655,57 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     return C_OK;
 }
 
+/* Try to offload a cluster link write to an I/O thread.
+ * Swaps pending→inflight, then enqueues a tagged job onto io_shared_inbox.
+ * Returns C_OK if offloaded or if a job is already pending (to prevent
+ *   the caller from falling back to synchronous I/O on a connection
+ *   with an in-flight worker job).
+ * Returns C_ERR if fallback is needed (pool inactive or spmcEnqueue fails). */
+int trySendClusterWriteToIOThreads(struct clusterLink *link) {
+    /* If any I/O job is already in flight for this link, return C_OK
+     * so the caller does NOT fall back to synchronous I/O. */
+    if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+    if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+
+    /* Nothing to write. */
+    if (listLength(link->send_msg_queue_pending) == 0) return C_OK;
+
+    /* No I/O thread pool available — synchronous fallback. */
+    if (server.active_io_threads_num <= 1) {
+        server.stat_cluster_io_sync_fallbacks++;
+        return C_ERR;
+    }
+
+    /* Postpone connection state updates while the I/O thread operates. */
+    connSetPostponeUpdateState(link->conn, 1);
+
+    /* O(1) swap: pending becomes inflight, pending gets the (empty) inflight list. */
+    list *tmp = link->send_msg_queue_inflight;
+    link->send_msg_queue_inflight = link->send_msg_queue_pending;
+    link->send_msg_queue_pending = tmp;
+    link->inflight_send_offset = 0;
+
+    /* Transition link to pending-write state. */
+    link->io_write_state = CLUSTER_LINK_IO_PENDING;
+    link->io_refs++;
+
+    /* Enqueue the write job. */
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_CLUSTER_WRITE)) == false)) {
+        /* Rollback: swap back. */
+        tmp = link->send_msg_queue_inflight;
+        link->send_msg_queue_inflight = link->send_msg_queue_pending;
+        link->send_msg_queue_pending = tmp;
+        link->io_write_state = CLUSTER_LINK_IO_IDLE;
+        link->io_refs--;
+        connSetPostponeUpdateState(link->conn, 0);
+        server.stat_cluster_io_sync_fallbacks++;
+        return C_ERR;
+    }
+
+    io_jobs_submitted++;
+    return C_OK;
+}
+
 /* Internal function to free the client's argv in an IO thread. */
 void IOThreadFreeArgv(robj **argv) {
     int last_arg = 0;
