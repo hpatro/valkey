@@ -333,3 +333,23 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
         }
     }
 }
+
+start_server {tags {"external:skip"}} {
+    test {Cluster I/O offload stats are present in INFO and reset by CONFIG RESETSTAT} {
+        set info [r info stats]
+
+        # Verify all cluster I/O offload counters exist and start at 0
+        assert_equal 0 [getInfoProperty $info cluster_io_reads_offloaded]
+        assert_equal 0 [getInfoProperty $info cluster_io_sync_fallbacks]
+        assert_equal 0 [getInfoProperty $info cluster_io_async_closed_links]
+        assert_equal 0 [getInfoProperty $info cluster_io_queued_inbound_packets]
+
+        # Reset stats and verify they remain 0
+        r config resetstat
+        set info [r info stats]
+        assert_equal 0 [getInfoProperty $info cluster_io_reads_offloaded]
+        assert_equal 0 [getInfoProperty $info cluster_io_sync_fallbacks]
+        assert_equal 0 [getInfoProperty $info cluster_io_async_closed_links]
+        assert_equal 0 [getInfoProperty $info cluster_io_queued_inbound_packets]
+    }
+}
