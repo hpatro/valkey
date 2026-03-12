@@ -4532,6 +4532,11 @@ void clusterWriteHandler(connection *conn) {
         totwritten += nwritten;
     }
 
+    /* Unregister the write handler when the queue is empty to avoid
+     * burning CPU on spurious writable events. This also covers the
+     * I/O-thread offload case: when trySendClusterWriteToIOThreads()
+     * swaps send_msg_queue to inflight, the queue becomes empty, so
+     * this handler fires once, sees nothing to write, and removes itself. */
     if (listLength(link->send_msg_queue) == 0) connSetWriteHandler(link->conn, NULL);
 }
 
@@ -4784,6 +4789,11 @@ void clusterSendMessage(clusterLink *link, clusterMsgSendBlock *msgblock) {
     /* Populate sent messages stats. */
     uint16_t type = ntohs(getMessageFromSendBlock(msgblock)->type) & ~CLUSTERMSG_MODIFIER_MASK;
     if (type < CLUSTERMSG_TYPE_COUNT) server.cluster->stats_bus_messages_sent[type]++;
+
+    /* Try to offload the write to an I/O thread. The sync write handler
+     * stays installed — if the offload took the data, the handler will
+     * fire, see an empty queue, and remove itself harmlessly. */
+    trySendClusterWriteToIOThreads(link);
 }
 
 /* Send a message to all the nodes that are part of the cluster having
@@ -8788,9 +8798,22 @@ void clusterHandleWriteCompletion(clusterLink *link) {
         return;
     }
 
-    /* Reschedule a write job if data remains in inflight or pending queues. */
-    if (listLength(link->send_msg_queue_inflight) > 0 || listLength(link->send_msg_queue_pending) > 0) {
-        trySendClusterWriteToIOThreads(link);
+    /* Reschedule a write job if data remains in inflight or the main send queue.
+     * If offload fails (pool went inactive), move any remaining inflight data
+     * back to send_msg_queue and reinstall the sync write handler. */
+    if (listLength(link->send_msg_queue_inflight) > 0 || listLength(link->send_msg_queue) > 0) {
+        if (trySendClusterWriteToIOThreads(link) == C_ERR && link->conn) {
+            /* Move inflight remainder back to the front of send_msg_queue. */
+            if (listLength(link->send_msg_queue_inflight) > 0) {
+                link->head_msg_send_offset = link->inflight_send_offset;
+                listJoin(link->send_msg_queue_inflight, link->send_msg_queue);
+                /* Swap so inflight (now holding everything) becomes send_msg_queue. */
+                list *tmp = link->send_msg_queue;
+                link->send_msg_queue = link->send_msg_queue_inflight;
+                link->send_msg_queue_inflight = tmp;
+            }
+            connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
+        }
     }
 }
 

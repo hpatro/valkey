@@ -659,7 +659,9 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
 }
 
 /* Try to offload a cluster link write to an I/O thread.
- * Swaps pending→inflight, then enqueues a tagged job onto io_shared_inbox.
+ * Swaps send_msg_queue→inflight, then enqueues a tagged job onto io_shared_inbox.
+ * New messages appended by clusterSendMessage during the write go into
+ * send_msg_queue (which receives the old empty inflight list after the swap).
  * Returns C_OK if offloaded or if a job is already pending (to prevent
  *   the caller from falling back to synchronous I/O on a connection
  *   with an in-flight worker job).
@@ -671,7 +673,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
     if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return C_OK;
 
     /* Nothing to write. */
-    if (listLength(link->send_msg_queue_pending) == 0) return C_OK;
+    if (listLength(link->send_msg_queue) == 0) return C_OK;
 
     /* No I/O thread pool available — synchronous fallback. */
     if (server.active_io_threads_num <= 1) {
@@ -682,10 +684,12 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
     /* Postpone connection state updates while the I/O thread operates. */
     connSetPostponeUpdateState(link->conn, 1);
 
-    /* O(1) swap: pending becomes inflight, pending gets the (empty) inflight list. */
+    /* O(1) swap: send_msg_queue becomes inflight, send_msg_queue gets the
+     * (empty) old inflight list. New messages during the write go into
+     * send_msg_queue without touching inflight. */
     list *tmp = link->send_msg_queue_inflight;
-    link->send_msg_queue_inflight = link->send_msg_queue_pending;
-    link->send_msg_queue_pending = tmp;
+    link->send_msg_queue_inflight = link->send_msg_queue;
+    link->send_msg_queue = tmp;
     link->inflight_send_offset = 0;
 
     /* Transition link to pending-write state. */
@@ -696,8 +700,8 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
     if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_CLUSTER_WRITE)) == false)) {
         /* Rollback: swap back. */
         tmp = link->send_msg_queue_inflight;
-        link->send_msg_queue_inflight = link->send_msg_queue_pending;
-        link->send_msg_queue_pending = tmp;
+        link->send_msg_queue_inflight = link->send_msg_queue;
+        link->send_msg_queue = tmp;
         link->io_write_state = CLUSTER_LINK_IO_IDLE;
         link->io_refs--;
         connSetPostponeUpdateState(link->conn, 0);
