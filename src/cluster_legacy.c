@@ -4781,7 +4781,11 @@ void clusterSendMessage(clusterLink *link, clusterMsgSendBlock *msgblock) {
     if (!link) {
         return;
     }
-    if (listLength(link->send_msg_queue) == 0 && getMessageFromSendBlock(msgblock)->totlen != 0)
+    /* Only install the sync write handler if no I/O write job is in flight.
+     * If a write job is in flight, the completion handler will reschedule
+     * or reinstall the sync handler as needed. */
+    if (link->io_write_state == CLUSTER_LINK_IO_IDLE && listLength(link->send_msg_queue) == 0 &&
+        getMessageFromSendBlock(msgblock)->totlen != 0)
         connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
 
     listAddNodeTail(link->send_msg_queue, msgblock);
