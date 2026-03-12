@@ -2809,6 +2809,8 @@ void resetServerStats(void) {
     server.aof_delayed_fsync = 0;
     server.stat_reply_buffer_shrinks = 0;
     server.stat_cluster_reads_offloaded = 0;
+    server.stat_cluster_writes_offloaded = 0;
+    server.stat_cluster_accepts_offloaded = 0;
     server.stat_cluster_io_sync_fallbacks = 0;
     server.stat_cluster_async_closed_links = 0;
     server.stat_cluster_queued_inbound_packets = 0;
@@ -3011,6 +3013,8 @@ void initServer(void) {
     for (int j = 0; j < CLIENT_TYPE_COUNT; j++) server.stat_clients_type_memory[j] = 0;
     server.stat_cluster_links_memory = 0;
     server.stat_cluster_reads_offloaded = 0;
+    server.stat_cluster_writes_offloaded = 0;
+    server.stat_cluster_accepts_offloaded = 0;
     server.stat_cluster_io_sync_fallbacks = 0;
     server.stat_cluster_async_closed_links = 0;
     server.stat_cluster_queued_inbound_packets = 0;
@@ -6408,6 +6412,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_reads_offloaded,
+                "cluster_io_writes_offloaded:%lld\r\n", server.stat_cluster_writes_offloaded,
+                "cluster_io_accepts_offloaded:%lld\r\n", server.stat_cluster_accepts_offloaded,
                 "cluster_io_sync_fallbacks:%lld\r\n", server.stat_cluster_io_sync_fallbacks,
                 "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_async_closed_links,
                 "cluster_io_queued_inbound_packets:%lld\r\n", server.stat_cluster_queued_inbound_packets,

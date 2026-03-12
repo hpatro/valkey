@@ -713,6 +713,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
     }
 
     io_jobs_submitted++;
+    server.stat_cluster_writes_offloaded++;
     return C_OK;
 }
 
@@ -721,16 +722,21 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
  * Returns C_OK if offloaded, C_ERR if fallback is needed. */
 int trySendClusterAcceptToIOThreads(connection *conn) {
     if (!(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD)) return C_ERR;
-    if (server.active_io_threads_num <= 1) return C_ERR;
+    if (server.active_io_threads_num <= 1) {
+        server.stat_cluster_io_sync_fallbacks++;
+        return C_ERR;
+    }
 
     connSetPostponeUpdateState(conn, 1);
 
     if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(conn, JOB_REQ_CLUSTER_ACCEPT)) == false)) {
         connSetPostponeUpdateState(conn, 0);
+        server.stat_cluster_io_sync_fallbacks++;
         return C_ERR;
     }
 
     io_jobs_submitted++;
+    server.stat_cluster_accepts_offloaded++;
     return C_OK;
 }
 
