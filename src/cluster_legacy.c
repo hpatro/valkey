@@ -4683,6 +4683,12 @@ int clusterFramePackets(char *rcvbuf,
 static void clusterReadOffloadHandler(connection *conn) {
     clusterLink *link = connGetPrivateData(conn);
 
+    /* A worker read job is still in flight or its completion hasn't been
+     * consumed yet. Do not touch framed_packets or rcvbuf from the main
+     * thread until clusterHandleReadCompletion() transitions the link back
+     * to idle. */
+    if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return;
+
     /* Drain leftover framed packets before dispatching a new read or
      * falling back to sync. These are packets framed by a previous I/O
      * thread read that weren't fully applied due to the per-iteration budget. */
