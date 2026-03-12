@@ -633,6 +633,9 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return C_OK;
     if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
 
+    /* Invariant: io_refs must be 0 when both states are IDLE. */
+    serverAssert(link->io_refs == 0);
+
     /* Don't dispatch a new read if there are unapplied framed packets
      * from a previous bounded application. The readable event will keep
      * firing; the offload handler falls back to sync which drains them. */
@@ -682,6 +685,9 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
      * so the caller does NOT fall back to synchronous I/O. */
     if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
     if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+
+    /* Invariant: io_refs must be 0 when both states are IDLE. */
+    serverAssert(link->io_refs == 0);
 
     /* Nothing to write. */
     if (listLength(link->send_msg_queue) == 0) return C_OK;

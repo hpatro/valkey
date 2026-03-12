@@ -1807,12 +1807,17 @@ int freeClusterLink(clusterLink *link) {
 
     /* If I/O jobs are in flight, defer the actual free. */
     if (link->io_refs > 0) {
+        serverAssert(link->io_read_state == CLUSTER_LINK_IO_PENDING ||
+                     link->io_write_state == CLUSTER_LINK_IO_PENDING);
         link->async_close = 1;
         server.stat_cluster_async_closed_links++;
         return 0;
     }
 
-    /* Immediate free path. */
+    /* Immediate free path — both states must be idle. */
+    serverAssert(link->io_read_state == CLUSTER_LINK_IO_IDLE);
+    serverAssert(link->io_write_state == CLUSTER_LINK_IO_IDLE);
+    serverAssert(link->io_refs == 0);
     server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue) * sizeof(listNode);
     listRelease(link->send_msg_queue);
 
@@ -8568,6 +8573,10 @@ void clusterReadJob(clusterLink *link) {
     clusterIOResult result = CLUSTER_IO_OK;
     ssize_t total_read = 0;
 
+    /* I/O thread invariant: we must be in PENDING state. */
+    serverAssert(link->io_read_state == CLUSTER_LINK_IO_PENDING);
+    serverAssert(link->io_write_state == CLUSTER_LINK_IO_IDLE);
+
     if (conn == NULL) {
         link->io_result = CLUSTER_IO_READ_ERROR;
         sendToMainThread(link, JOB_RES_CLUSTER_READ);
@@ -8652,6 +8661,10 @@ void clusterWriteJob(clusterLink *link) {
     int nodes_sent = 0;
     listNode *node = listFirst(link->send_msg_queue_inflight);
 
+    /* I/O thread invariant: we must be in PENDING state. */
+    serverAssert(link->io_write_state == CLUSTER_LINK_IO_PENDING);
+    serverAssert(link->io_read_state == CLUSTER_LINK_IO_IDLE);
+
     if (conn == NULL) {
         link->inflight_nodes_sent = 0;
         link->io_result = CLUSTER_IO_WRITE_ERROR;
@@ -8717,6 +8730,9 @@ void clusterHandleReadCompletion(clusterLink *link) {
     }
 
     /* Transition back to idle and release the I/O ref. */
+    serverAssert(link->io_read_state == CLUSTER_LINK_IO_PENDING);
+    serverAssert(link->io_write_state == CLUSTER_LINK_IO_IDLE);
+    serverAssert(link->io_refs > 0);
     link->io_read_state = CLUSTER_LINK_IO_IDLE;
     link->io_refs--;
 
@@ -8822,6 +8838,9 @@ void clusterHandleWriteCompletion(clusterLink *link) {
     }
 
     /* Transition back to idle and release the I/O ref. */
+    serverAssert(link->io_write_state == CLUSTER_LINK_IO_PENDING);
+    serverAssert(link->io_read_state == CLUSTER_LINK_IO_IDLE);
+    serverAssert(link->io_refs > 0);
     link->io_write_state = CLUSTER_LINK_IO_IDLE;
     link->io_refs--;
 
