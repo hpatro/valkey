@@ -4675,9 +4675,31 @@ int clusterFramePackets(char *rcvbuf,
 
 /* Cluster readable event handler: try to offload the read to an I/O thread.
  * If offload is unavailable (pool inactive, queue full), fall back to the
- * synchronous clusterReadHandler. */
+ * synchronous clusterReadHandler.
+ * First drains any leftover framed packets from a previous bounded application. */
 static void clusterReadOffloadHandler(connection *conn) {
     clusterLink *link = connGetPrivateData(conn);
+
+    /* Drain leftover framed packets before dispatching a new read or
+     * falling back to sync. These are packets framed by a previous I/O
+     * thread read that weren't fully applied due to the per-iteration budget. */
+    while (listLength(link->framed_packets) > 0) {
+        listNode *ln = listFirst(link->framed_packets);
+        char *pkt = ln->value;
+        clusterMsgHeader *hdr = (clusterMsgHeader *)pkt;
+        uint32_t totlen = ntohl(hdr->totlen);
+
+        listDelNode(link->framed_packets, ln);
+        link->framed_packets_mem -= totlen;
+        server.stat_cluster_links_memory -= totlen;
+
+        int ret = clusterProcessPacketBuffer(link, pkt, totlen);
+        zfree(pkt);
+        server.stat_cluster_queued_inbound_packets--;
+
+        if (!ret) return; /* Link freed */
+    }
+
     if (trySendClusterReadToIOThreads(link) == C_ERR) {
         clusterReadHandler(conn);
     }
@@ -8684,8 +8706,9 @@ void clusterHandleReadCompletion(clusterLink *link) {
     }
 
     /* Account for framed packet memory produced by the I/O thread.
-     * framed_packets_mem tracks packet buffer sizes only (not list node overhead),
-     * consistent with freeClusterLink's accounting. */
+     * framed_packets is guaranteed empty before dispatch (leftovers are
+     * drained in clusterReadOffloadHandler), so framed_packets_mem and
+     * listLength reflect only this job's output. */
     server.stat_cluster_links_memory += link->framed_packets_mem;
     server.stat_cluster_queued_inbound_packets += listLength(link->framed_packets);
 
