@@ -369,6 +369,9 @@ static void *IOThreadMain(void *myid) {
             case JOB_REQ_CLUSTER_READ:
                 clusterReadJob((clusterLink *)data);
                 break;
+            case JOB_REQ_CLUSTER_WRITE:
+                clusterWriteJob((clusterLink *)data);
+                break;
             default:
                 serverPanic("Invalid SPMC job type: %d", type);
             }

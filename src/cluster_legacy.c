@@ -1745,6 +1745,7 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->send_msg_queue_inflight = listCreate();
     listSetFreeMethod(link->send_msg_queue_inflight, clusterMsgSendBlockDecrRefCount);
     link->inflight_send_offset = 0;
+    link->inflight_bytes_sent = 0;
     link->send_msg_queue_mem += sizeof(list) + sizeof(list); /* Track both new lists */
 
     /* Failure detection timestamp */
@@ -8581,6 +8582,55 @@ void clusterReadJob(clusterLink *link) {
     /* Post result and completion to the main thread. */
     link->io_result = result;
     sendToMainThread(link, JOB_RES_CLUSTER_READ);
+}
+
+/* I/O thread worker: write bytes from the inflight send queue to the
+ * connection, starting at inflight_send_offset.
+ *
+ * Must NOT touch clusterNode, clusterState, server.stat_cluster_links_memory,
+ * or any main-thread-only structure. Memory accounting updates are deferred
+ * to the main-thread completion handler. */
+void clusterWriteJob(clusterLink *link) {
+    connection *conn = link->conn;
+    clusterIOResult result = CLUSTER_IO_OK;
+    size_t bytes_sent = 0; /* Total block bytes of fully-sent nodes */
+    int nodes_popped = 0;
+
+    while (listLength(link->send_msg_queue_inflight) > 0) {
+        listNode *head = listFirst(link->send_msg_queue_inflight);
+        clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
+        clusterMsg *msg = &msgblock->data[0].msg;
+        size_t msg_len = ntohl(msg->totlen);
+        size_t msg_offset = link->inflight_send_offset;
+
+        ssize_t nwritten = connWrite(conn, (char *)msg + msg_offset, msg_len - msg_offset);
+        if (nwritten <= 0) {
+            if (nwritten == -1 && connGetState(conn) == CONN_STATE_CONNECTED) {
+                /* EAGAIN — kernel buffer full, stop for now. */
+                break;
+            }
+            result = CLUSTER_IO_WRITE_ERROR;
+            break;
+        }
+
+        link->inflight_send_offset += nwritten;
+        if (link->inflight_send_offset < msg_len) {
+            /* Partial write — stop, completion handler will reschedule. */
+            break;
+        }
+
+        /* Fully sent this message node — pop and track for memory accounting. */
+        link->inflight_send_offset = 0;
+        bytes_sent += msgblock->totlen;
+        nodes_popped++;
+        listDelNode(link->send_msg_queue_inflight, head);
+    }
+
+    /* Store accounting data for the main-thread completion handler. */
+    link->inflight_bytes_sent = bytes_sent;
+
+    link->io_result = result;
+    sendToMainThread(link, JOB_RES_CLUSTER_WRITE);
 }
 
 /* ===================== Cluster I/O Completion Handlers =====================

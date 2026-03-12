@@ -70,6 +70,7 @@ typedef struct clusterLink {
     list *send_msg_queue_pending;          /* Main-thread appends here */
     list *send_msg_queue_inflight;         /* Frozen for one write job */
     size_t inflight_send_offset;           /* Byte offset into head of inflight queue */
+    size_t inflight_bytes_sent;            /* Total block bytes of fully-sent nodes (set by I/O thread) */
 
     /* Timestamp for failure detection (cross-thread) */
     _Atomic mstime_t last_io_read_time;    /* Updated by I/O thread on successful read */
@@ -520,5 +521,6 @@ void clusterHandleReadCompletion(clusterLink *link);
 void clusterHandleWriteCompletion(clusterLink *link);
 void clusterHandleAcceptCompletion(connection *conn);
 void clusterReadJob(clusterLink *link);
+void clusterWriteJob(clusterLink *link);
 
 #endif // CLUSTER_LEGACY_H
