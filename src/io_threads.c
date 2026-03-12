@@ -7,6 +7,7 @@
 #include "io_threads.h"
 #include "cluster.h"
 #include "cluster_legacy.h"
+#include "connhelpers.h"
 #include "queues.h"
 #include <sys/resource.h>
 
@@ -645,6 +646,7 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
 
     /* Postpone connection state updates while the I/O thread operates. */
     connSetPostponeUpdateState(link->conn, 1);
+    connIncrRefs(link->conn);
 
     /* Transition link to pending-read state. */
     link->io_read_state = CLUSTER_LINK_IO_PENDING;
@@ -656,6 +658,7 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
         /* Rollback on enqueue failure. */
         link->io_read_state = CLUSTER_LINK_IO_IDLE;
         link->io_refs--;
+        connDecrRefs(link->conn);
         connSetPostponeUpdateState(link->conn, 0);
         server.stat_cluster_io_sync_fallbacks++;
         return C_ERR;
@@ -691,6 +694,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
 
     /* Postpone connection state updates while the I/O thread operates. */
     connSetPostponeUpdateState(link->conn, 1);
+    connIncrRefs(link->conn);
 
     /* O(1) swap: send_msg_queue becomes inflight, send_msg_queue gets the
      * (empty) old inflight list. New messages during the write go into
@@ -713,6 +717,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
         link->send_msg_queue = tmp;
         link->io_write_state = CLUSTER_LINK_IO_IDLE;
         link->io_refs--;
+        connDecrRefs(link->conn);
         connSetPostponeUpdateState(link->conn, 0);
         server.stat_cluster_io_sync_fallbacks++;
         return C_ERR;
@@ -734,8 +739,10 @@ int trySendClusterAcceptToIOThreads(connection *conn) {
     }
 
     connSetPostponeUpdateState(conn, 1);
+    connIncrRefs(conn);
 
     if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(conn, JOB_REQ_CLUSTER_ACCEPT)) == false)) {
+        connDecrRefs(conn);
         connSetPostponeUpdateState(conn, 0);
         server.stat_cluster_io_sync_fallbacks++;
         return C_ERR;

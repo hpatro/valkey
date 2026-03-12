@@ -43,6 +43,7 @@
 #include "cluster_migrateslots.h"
 #include "endianconv.h"
 #include "connection.h"
+#include "connhelpers.h"
 #include "module.h"
 #include "io_threads.h"
 
@@ -1798,10 +1799,12 @@ int freeClusterLink(clusterLink *link) {
         link->node = NULL;
     }
 
-    /* Close the connection (causes in-flight I/O to fail). */
+    /* Close the connection (causes in-flight I/O to fail).
+     * If I/O jobs are in flight, keep link->conn valid until the completion
+     * handler releases its connection ref and we finalize teardown. */
     if (link->conn) {
         connClose(link->conn);
-        link->conn = NULL;
+        if (link->io_refs == 0) link->conn = NULL;
     }
 
     /* If I/O jobs are in flight, defer the actual free. */
@@ -4694,10 +4697,10 @@ static void clusterReadOffloadHandler(connection *conn) {
         server.stat_cluster_links_memory -= totlen;
 
         int ret = clusterProcessPacketBuffer(link, pkt, totlen);
-        zfree(pkt);
         server.stat_cluster_queued_inbound_packets--;
 
-        if (!ret) return; /* Link freed */
+        if (!ret) return; /* Link freed, pkt was freed via link->rcvbuf */
+        zfree(pkt);
     }
 
     if (trySendClusterReadToIOThreads(link) == C_ERR) {
@@ -8563,6 +8566,12 @@ void clusterReadJob(clusterLink *link) {
     clusterIOResult result = CLUSTER_IO_OK;
     ssize_t total_read = 0;
 
+    if (conn == NULL) {
+        link->io_result = CLUSTER_IO_READ_ERROR;
+        sendToMainThread(link, JOB_RES_CLUSTER_READ);
+        return;
+    }
+
     /* Read loop: pull as many bytes as the kernel has ready. */
     while (1) {
         /* Ensure at least some space in rcvbuf. */
@@ -8641,6 +8650,13 @@ void clusterWriteJob(clusterLink *link) {
     int nodes_sent = 0;
     listNode *node = listFirst(link->send_msg_queue_inflight);
 
+    if (conn == NULL) {
+        link->inflight_nodes_sent = 0;
+        link->io_result = CLUSTER_IO_WRITE_ERROR;
+        sendToMainThread(link, JOB_RES_CLUSTER_WRITE);
+        return;
+    }
+
     while (node) {
         clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)node->value;
         clusterMsg *msg = &msgblock->data[0].msg;
@@ -8675,6 +8691,9 @@ void clusterWriteJob(clusterLink *link) {
 /* I/O thread worker: perform TLS accept handshake on a cluster connection.
  * No clusterLink exists yet — it is created by the main thread on success. */
 void clusterAcceptJob(connection *conn) {
+    if (conn == NULL) {
+        return;
+    }
     connAccept(conn, NULL);
     sendToMainThread(conn, JOB_RES_CLUSTER_ACCEPT);
 }
@@ -8692,6 +8711,7 @@ void clusterHandleReadCompletion(clusterLink *link) {
     if (conn) {
         connSetPostponeUpdateState(conn, 0);
         connUpdateState(conn);
+        connDecrRefs(conn);
     }
 
     /* Transition back to idle and release the I/O ref. */
@@ -8777,14 +8797,15 @@ void clusterHandleReadCompletion(clusterLink *link) {
         server.stat_cluster_links_memory -= totlen;
 
         int ret = clusterProcessPacketBuffer(link, pkt, totlen);
-        zfree(pkt);
-        applied++;
         server.stat_cluster_queued_inbound_packets--;
 
         if (!ret) {
-            /* Link was freed by clusterProcessPacket — stop immediately. */
+            /* Link was freed by clusterProcessPacket, which also freed pkt via link->rcvbuf. */
             return;
         }
+
+        zfree(pkt);
+        applied++;
     }
 }
 
@@ -8795,6 +8816,7 @@ void clusterHandleWriteCompletion(clusterLink *link) {
     if (conn) {
         connSetPostponeUpdateState(conn, 0);
         connUpdateState(conn);
+        connDecrRefs(conn);
     }
 
     /* Transition back to idle and release the I/O ref. */
@@ -8858,6 +8880,7 @@ void clusterHandleWriteCompletion(clusterLink *link) {
 void clusterHandleAcceptCompletion(connection *conn) {
     connSetPostponeUpdateState(conn, 0);
     connUpdateState(conn);
+    connDecrRefs(conn);
 
     if (connGetState(conn) != CONN_STATE_CONNECTED) {
         serverLog(LL_VERBOSE, "Error accepting cluster node connection: %s", connGetLastError(conn));
