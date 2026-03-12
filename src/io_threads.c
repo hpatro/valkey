@@ -5,17 +5,10 @@
  */
 
 #include "io_threads.h"
+#include "cluster.h"
+#include "cluster_legacy.h"
 #include "queues.h"
 #include <sys/resource.h>
-
-/* Forward declarations for cluster I/O completion handling.
- * For read/write completions, the tagged pointer is the clusterLink* itself.
- * For accept completions, the tagged pointer is the connection*.
- * The handler functions are implemented in cluster_legacy.c. */
-struct clusterLink;
-void clusterHandleReadCompletion(struct clusterLink *link);
-void clusterHandleWriteCompletion(struct clusterLink *link);
-void clusterHandleAcceptCompletion(connection *conn);
 
 static _Thread_local int thread_id = 0;
 static _Thread_local mpscTicket io_thread_ticket = {0};
@@ -615,6 +608,41 @@ int trySendWriteToIOThreads(client *c) {
 
     io_jobs_submitted++;
     server.stat_io_writes_pending++;
+    return C_OK;
+}
+
+/* Try to offload a cluster link read to an I/O thread.
+ * Enqueues a tagged job onto io_shared_inbox (SPMC queue).
+ * Returns C_OK if offloaded or if a job is already pending (to prevent
+ *   the caller from falling back to synchronous I/O on a connection
+ *   with an in-flight worker job).
+ * Returns C_ERR if fallback is needed (pool inactive or spmcEnqueue fails). */
+int trySendClusterReadToIOThreads(struct clusterLink *link) {
+    /* If any I/O job is already in flight for this link, return C_OK
+     * so the caller does NOT fall back to synchronous I/O. */
+    if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+    if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+
+    /* No I/O thread pool available — synchronous fallback. */
+    if (server.active_io_threads_num <= 1) return C_ERR;
+
+    /* Postpone connection state updates while the I/O thread operates. */
+    connSetPostponeUpdateState(link->conn, 1);
+
+    /* Transition link to pending-read state. */
+    link->io_read_state = CLUSTER_LINK_IO_PENDING;
+    link->io_refs++;
+
+    /* Enqueue the read job. */
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_CLUSTER_READ)) == false)) {
+        /* Rollback on enqueue failure. */
+        link->io_read_state = CLUSTER_LINK_IO_IDLE;
+        link->io_refs--;
+        connSetPostponeUpdateState(link->conn, 0);
+        return C_ERR;
+    }
+
+    io_jobs_submitted++;
     return C_OK;
 }
 
