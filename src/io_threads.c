@@ -635,6 +635,7 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     /* Transition link to pending-read state. */
     link->io_read_state = CLUSTER_LINK_IO_PENDING;
     link->io_refs++;
+    link->rcvbuf_alloc_at_dispatch = link->rcvbuf_alloc;
 
     /* Enqueue the read job. */
     if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_CLUSTER_READ)) == false)) {

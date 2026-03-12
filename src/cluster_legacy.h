@@ -74,6 +74,9 @@ typedef struct clusterLink {
     /* Timestamp for failure detection (cross-thread) */
     _Atomic mstime_t last_io_read_time;    /* Updated by I/O thread on successful read */
 
+    /* Pre-dispatch rcvbuf_alloc for memory accounting on completion */
+    size_t rcvbuf_alloc_at_dispatch;       /* rcvbuf_alloc when read job was dispatched */
+
     /* Framed packet queue for read offload */
     list *framed_packets;                  /* List of framed packet buffers */
     size_t framed_packets_mem;             /* Memory in bytes used by framed_packets */

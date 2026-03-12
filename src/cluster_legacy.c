@@ -61,6 +61,8 @@
  * that represents this node. */
 clusterNode *myself = NULL;
 
+extern int ProcessingEventsWhileBlocked;
+
 clusterNode *createClusterNode(char *nodename, int flags);
 void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -1750,6 +1752,7 @@ clusterLink *createClusterLink(clusterNode *node) {
     /* Framed packet queue */
     link->framed_packets = listCreate();
     link->framed_packets_mem = 0;
+    link->rcvbuf_alloc_at_dispatch = 0;
 
     server.stat_cluster_links_memory += link->rcvbuf_alloc + link->send_msg_queue_mem;
     link->conn = NULL;
@@ -8574,7 +8577,103 @@ void clusterReadJob(clusterLink *link) {
  * is the clusterLink* (read/write) or connection* (accept) directly. */
 
 void clusterHandleReadCompletion(clusterLink *link) {
-    UNUSED(link);
+    connection *conn = link->conn;
+
+    /* Apply deferred connection state transitions. conn may be NULL if
+     * freeClusterLink was called while the job was in flight (async_close). */
+    if (conn) {
+        connSetPostponeUpdateState(conn, 0);
+        connUpdateState(conn);
+    }
+
+    /* Transition back to idle and release the I/O ref. */
+    link->io_read_state = CLUSTER_LINK_IO_IDLE;
+    link->io_refs--;
+
+    /* Update stat_cluster_links_memory for rcvbuf growth that occurred on
+     * the I/O thread (the I/O thread grows rcvbuf_alloc but does not touch
+     * the global stat). */
+    if (link->rcvbuf_alloc > link->rcvbuf_alloc_at_dispatch) {
+        server.stat_cluster_links_memory += link->rcvbuf_alloc - link->rcvbuf_alloc_at_dispatch;
+    }
+
+    /* Account for framed packet memory produced by the I/O thread.
+     * framed_packets_mem tracks packet buffer sizes only (not list node overhead),
+     * consistent with freeClusterLink's accounting. */
+    server.stat_cluster_links_memory += link->framed_packets_mem;
+
+    /* If the link was already marked for async close, check if we can
+     * perform the final free now that io_refs has been decremented. */
+    if (link->async_close) {
+        if (link->io_refs == 0) {
+            /* Subtract framed_packets_mem we just added, then free packets. */
+            server.stat_cluster_links_memory -= link->framed_packets_mem;
+            listNode *ln;
+            while ((ln = listFirst(link->framed_packets)) != NULL) {
+                zfree(ln->value);
+                listDelNode(link->framed_packets, ln);
+            }
+            link->framed_packets_mem = 0;
+            freeClusterLink(link);
+        }
+        return;
+    }
+
+    clusterIOResult result = link->io_result;
+
+    /* Handle error results: log and tear down the link. */
+    if (result == CLUSTER_IO_BAD_HEADER || result == CLUSTER_IO_BAD_LENGTH) {
+        serverLog(LL_WARNING, "Bad cluster packet header/length from node %.40s:%s (%s)",
+                  clusterLinkGetNodeName(link),
+                  link->inbound ? "inbound" : "outbound",
+                  clusterLinkGetHumanNodeName(link));
+        freeClusterLink(link);
+        return;
+    }
+
+    if (result == CLUSTER_IO_READ_ERROR || result == CLUSTER_IO_EOF) {
+        serverLog(LL_DEBUG, "I/O error reading from node link (%.40s:%s) (%s): %s",
+                  clusterLinkGetNodeName(link),
+                  link->inbound ? "inbound" : "outbound",
+                  clusterLinkGetHumanNodeName(link),
+                  (result == CLUSTER_IO_EOF) ? "connection closed" : "read error");
+        freeClusterLink(link);
+        return;
+    }
+
+    /* Success path: apply framed packets.
+     * Normal path: up to 64 packets or 250µs.
+     * Blocked path: up to 8 packets or 50µs. */
+    int max_packets = ProcessingEventsWhileBlocked ? 8 : 64;
+    long long max_usec = ProcessingEventsWhileBlocked ? 50 : 250;
+    monotime start = 0;
+    elapsedStart(&start);
+    int applied = 0;
+
+    listNode *ln;
+    while ((ln = listFirst(link->framed_packets)) != NULL) {
+        if (applied >= max_packets) break;
+        if (applied > 0 && (long long)elapsedUs(start) >= max_usec) break;
+
+        char *pkt = ln->value;
+        clusterMsgHeader *hdr = (clusterMsgHeader *)pkt;
+        uint32_t totlen = ntohl(hdr->totlen);
+
+        /* Remove from list and update memory accounting before processing,
+         * since clusterProcessPacketBuffer may free the link. */
+        listDelNode(link->framed_packets, ln);
+        link->framed_packets_mem -= totlen;
+        server.stat_cluster_links_memory -= totlen;
+
+        int ret = clusterProcessPacketBuffer(link, pkt, totlen);
+        zfree(pkt);
+        applied++;
+
+        if (!ret) {
+            /* Link was freed by clusterProcessPacket — stop immediately. */
+            return;
+        }
+    }
 }
 
 void clusterHandleWriteCompletion(clusterLink *link) {
