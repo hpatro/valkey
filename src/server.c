@@ -2820,24 +2820,6 @@ void resetServerStats(void) {
     server.stat_cluster_io_sync_fallbacks = 0;
     server.stat_cluster_async_closed_links = 0;
     server.stat_cluster_queued_inbound_packets = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
-    server.stat_cluster_async_closed_links = 0;
-    server.stat_cluster_queued_inbound_packets = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
-    server.stat_cluster_async_closed_links = 0;
-    server.stat_cluster_queued_inbound_packets = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
-    server.stat_cluster_async_closed_links = 0;
-    server.stat_cluster_queued_inbound_packets = 0;
     server.stat_reply_buffer_expands = 0;
     memset(server.duration_stats, 0, sizeof(durationStats) * EL_DURATION_TYPE_NUM);
     server.el_cmd_cnt_max = 0;
@@ -3036,24 +3018,6 @@ void initServer(void) {
     server.stat_module_progress = 0;
     for (int j = 0; j < CLIENT_TYPE_COUNT; j++) server.stat_clients_type_memory[j] = 0;
     server.stat_cluster_links_memory = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
-    server.stat_cluster_async_closed_links = 0;
-    server.stat_cluster_queued_inbound_packets = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
-    server.stat_cluster_async_closed_links = 0;
-    server.stat_cluster_queued_inbound_packets = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
-    server.stat_cluster_async_closed_links = 0;
-    server.stat_cluster_queued_inbound_packets = 0;
     server.stat_cluster_reads_offloaded = 0;
     server.stat_cluster_writes_offloaded = 0;
     server.stat_cluster_accepts_offloaded = 0;
@@ -6447,36 +6411,18 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "tracking_total_keys:%lld\r\n", (unsigned long long)trackingGetTotalKeys(),
                 "tracking_total_items:%lld\r\n", (unsigned long long)trackingGetTotalItems(),
                 "tracking_total_prefixes:%lld\r\n", (unsigned long long)trackingGetTotalPrefixes(),
-                "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_reads_offloaded,
-                "cluster_io_writes_offloaded:%lld\r\n", server.stat_cluster_writes_offloaded,
-                "cluster_io_accepts_offloaded:%lld\r\n", server.stat_cluster_accepts_offloaded,
-                "cluster_io_sync_fallbacks:%lld\r\n", server.stat_cluster_io_sync_fallbacks,
-                "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_async_closed_links,
-                "cluster_io_queued_inbound_packets:%lld\r\n", server.stat_cluster_queued_inbound_packets,
                 "unexpected_error_replies:%lld\r\n", server.stat_unexpected_error_replies,
                 "total_error_replies:%lld\r\n", server.stat_total_error_replies,
                 "dump_payload_sanitizations:%lld\r\n", server.stat_dump_payload_sanitizations,
                 "total_reads_processed:%lld\r\n", server.stat_total_reads_processed,
                 "total_writes_processed:%lld\r\n", server.stat_total_writes_processed,
                 "io_threaded_reads_processed:%lld\r\n", server.stat_io_reads_processed,
-                "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_reads_offloaded,
-                "cluster_io_writes_offloaded:%lld\r\n", server.stat_cluster_writes_offloaded,
-                "cluster_io_accepts_offloaded:%lld\r\n", server.stat_cluster_accepts_offloaded,
-                "cluster_io_sync_fallbacks:%lld\r\n", server.stat_cluster_io_sync_fallbacks,
-                "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_async_closed_links,
-                "cluster_io_queued_inbound_packets:%lld\r\n", server.stat_cluster_queued_inbound_packets,
                 "io_threaded_writes_processed:%lld\r\n", server.stat_io_writes_processed,
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
-                "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_reads_offloaded,
-                "cluster_io_writes_offloaded:%lld\r\n", server.stat_cluster_writes_offloaded,
-                "cluster_io_accepts_offloaded:%lld\r\n", server.stat_cluster_accepts_offloaded,
-                "cluster_io_sync_fallbacks:%lld\r\n", server.stat_cluster_io_sync_fallbacks,
-                "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_async_closed_links,
-                "cluster_io_queued_inbound_packets:%lld\r\n", server.stat_cluster_queued_inbound_packets,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,
