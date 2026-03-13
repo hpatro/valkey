@@ -1551,18 +1551,6 @@ static void connTLSShutdown(connection *conn_) {
 static void connTLSClose(connection *conn_) {
     tls_connection *conn = (tls_connection *)conn_;
 
-    /* If called while the connection is still referenced (for example by an
-     * I/O-thread job), close the underlying fd and defer tearing down the
-     * TLS state until the final connClose() after refs reach zero. */
-    if (connHasRefs(conn_)) {
-        if (conn->pending_list_node) {
-            listDelNode(pending_list, conn->pending_list_node);
-            conn->pending_list_node = NULL;
-        }
-        connectionTypeTcp()->close(conn_);
-        return;
-    }
-
     if (conn->ssl) {
         if (conn->c.state == CONN_STATE_CONNECTED) SSL_shutdown(conn->ssl);
         SSL_free(conn->ssl);
