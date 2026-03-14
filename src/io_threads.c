@@ -966,7 +966,14 @@ int trySendAcceptToIOThreads(connection *conn) {
         return C_ERR;
     }
 
+    /* Cluster TLS accepts have no client private-data yet. Route them to the
+     * dedicated cluster accept offload path. */
+    if (connGetOwnerKind(conn) == CONN_OWNER_CLUSTER_LINK) {
+        return trySendClusterAcceptToIOThreads(conn);
+    }
+
     client *c = connGetPrivateData(conn);
+    serverAssert(c != NULL);
     if (c->io_read_state != CLIENT_IDLE) {
         return C_OK;
     }

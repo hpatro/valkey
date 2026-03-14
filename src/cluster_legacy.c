@@ -1922,6 +1922,9 @@ void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
 
         connection *conn = connCreateAccepted(connTypeOfCluster(), cfd, &require_auth);
+        /* Mark as cluster-owned before any TLS accept retries so generic
+         * accept offload routing can safely avoid client assumptions. */
+        connSetOwnerKind(conn, CONN_OWNER_CLUSTER_LINK);
         conn->flags |= CONN_FLAG_ALLOW_ACCEPT_OFFLOAD;
 
         /* Make sure connection is not in an error state */
@@ -8916,24 +8919,11 @@ void clusterHandleAcceptCompletion(connection *conn) {
     connDecrRefs(conn);
 
     /* TLS handshake may still be in progress (SSL_accept needs more
-     * event-loop iterations). Leave the connection open — the TLS event
-     * handler will continue the handshake. This mirrors the client-side
-     * pattern in processClientIOReadsDone (networking.c). */
+     * event-loop iterations). Keep the connection open; TLS event handling
+     * will trigger the next offloaded accept step. */
     if (connGetState(conn) == CONN_STATE_ACCEPTING) {
         return;
     }
 
-    if (connGetState(conn) != CONN_STATE_CONNECTED) {
-        serverLog(LL_VERBOSE, "Error accepting cluster node connection: %s", connGetLastError(conn));
-        connClose(conn);
-        return;
-    }
-
-    /* Accept succeeded — create the clusterLink and install the read handler.
-     * This mirrors clusterConnAcceptHandler. */
-    clusterLink *link = createClusterLink(NULL);
-    link->conn = conn;
-    connSetPrivateData(conn, link);
-    connSetOwnerKind(conn, CONN_OWNER_CLUSTER_LINK);
-    connSetReadHandler(conn, clusterReadOffloadHandler);
+    clusterConnAcceptHandler(conn);
 }
