@@ -4667,10 +4667,6 @@ static inline int isClusterMsgSignatureAndLengthValid(clusterMsgHeader *hdr) {
     return 1;
 }
 
-/* Framing bounds for clusterFramePackets. */
-#define CLUSTER_FRAME_MAX_PACKETS 16
-#define CLUSTER_FRAME_MAX_BYTES (64 * 1024) /* 64 KB */
-
 /* Frame packets from raw bytes in rcvbuf.
  *
  * Scans the buffer for complete cluster messages by validating the signature
@@ -4683,23 +4679,18 @@ static inline int isClusterMsgSignatureAndLengthValid(clusterMsgHeader *hdr) {
  * Thread-safe: reads only from the provided buffer, writes only to the output
  * list and consumed/result output parameters. Does not touch clusterNode,
  * clusterState, or any main-thread structure.
- *
- * Returns the number of packets framed. */
-int clusterFramePackets(char *rcvbuf,
+ **/
+void clusterFramePackets(char *rcvbuf,
                         size_t rcvbuf_len,
                         size_t *consumed,
                         list *framed_packets,
-                        int max_packets,
-                        size_t max_bytes,
                         clusterIOResult *result) {
     size_t offset = 0;
-    int packets = 0;
-    size_t bytes_framed = 0;
 
     *consumed = 0;
     *result = CLUSTER_IO_OK;
 
-    while (offset < rcvbuf_len && packets < max_packets && bytes_framed < max_bytes) {
+    while (offset < rcvbuf_len) {
         size_t remaining = rcvbuf_len - offset;
 
         /* Need at least the header to determine message length. */
@@ -4710,7 +4701,7 @@ int clusterFramePackets(char *rcvbuf,
         /* Validate signature and minimum length. */
         if (memcmp(hdr->sig, "RCmb", 4) != 0) {
             *result = CLUSTER_IO_BAD_HEADER;
-            return packets;
+            return;
         }
 
         uint32_t totlen = ntohl(hdr->totlen);
@@ -4719,7 +4710,7 @@ int clusterFramePackets(char *rcvbuf,
 
         if (totlen < minlen) {
             *result = CLUSTER_IO_BAD_LENGTH;
-            return packets;
+            return;
         }
 
         /* Wait for the full message to arrive. */
@@ -4731,12 +4722,9 @@ int clusterFramePackets(char *rcvbuf,
         listAddNodeTail(framed_packets, pkt);
 
         offset += totlen;
-        bytes_framed += totlen;
-        packets++;
     }
 
     *consumed = offset;
-    return packets;
 }
 
 /* Cluster readable event handler: try to offload the read to an I/O thread.
@@ -8680,7 +8668,7 @@ void clusterReadJob(clusterLink *link) {
         size_t consumed = 0;
         clusterIOResult frame_result;
         clusterFramePackets(link->rcvbuf, link->rcvbuf_len, &consumed,
-                            link->framed_packets, 16, 65536, &frame_result);
+                            link->framed_packets, &frame_result);
 
         /* Compact the receive buffer and track queued framed packet payload
          * bytes for accounting. This is not allocator-exact memory usage. */
