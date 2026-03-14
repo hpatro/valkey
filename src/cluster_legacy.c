@@ -4541,6 +4541,15 @@ static int clusterDrainFramedPackets(clusterLink *link) {
     return 1;
 }
 
+static void clusterShrinkRcvbuf(clusterLink *link) {
+    if (link->rcvbuf_alloc <= RCVBUF_INIT_LEN) return;
+
+    size_t prev_rcvbuf_alloc = link->rcvbuf_alloc;
+    zfree(link->rcvbuf);
+    link->rcvbuf = zmalloc(link->rcvbuf_alloc = RCVBUF_INIT_LEN);
+    server.stat_cluster_links_memory += link->rcvbuf_alloc - prev_rcvbuf_alloc;
+}
+
 /* This function is called when we detect the link with this node is lost.
    We set the node as no longer connected. The Cluster Cron will detect
    this connection and will try to get it connected again.
@@ -4824,13 +4833,8 @@ void clusterReadHandler(connection *conn) {
         /* Total length obtained? Process this packet. */
         if (rcvbuflen >= RCVBUF_MIN_READ_LEN && rcvbuflen == ntohl(hdr->totlen)) {
             if (clusterProcessPacket(link)) {
-                if (link->rcvbuf_alloc > RCVBUF_INIT_LEN) {
-                    size_t prev_rcvbuf_alloc = link->rcvbuf_alloc;
-                    zfree(link->rcvbuf);
-                    link->rcvbuf = zmalloc(link->rcvbuf_alloc = RCVBUF_INIT_LEN);
-                    server.stat_cluster_links_memory += link->rcvbuf_alloc - prev_rcvbuf_alloc;
-                }
                 link->rcvbuf_len = 0;
+                clusterShrinkRcvbuf(link);
             } else {
                 return; /* Link no longer valid. */
             }
@@ -8840,6 +8844,10 @@ void clusterHandleReadCompletion(clusterLink *link) {
     }
 
     if (!clusterDrainFramedPackets(link)) return;
+
+    if (link->rcvbuf_len == 0) {
+        clusterShrinkRcvbuf(link);
+    }
 
     if (result == CLUSTER_IO_READ_ERROR || result == CLUSTER_IO_EOF) {
         freeClusterLink(link);
