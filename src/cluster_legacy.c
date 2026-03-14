@@ -4474,8 +4474,9 @@ int clusterProcessPacket(clusterLink *link) {
  * clusterProcessPacket(), then:
  *   - If clusterProcessPacket() returns 1 (link still valid): restores
  *     the saved rcvbuf/rcvbuf_len and returns 1.
- *   - If clusterProcessPacket() returns 0 (link freed): the link object
- *     no longer exists, so no restore is performed. Returns 0.
+ *   - If clusterProcessPacket() returns 0 (link freed): frees the saved
+ *     original rcvbuf because freeClusterLink() released buf via
+ *     link->rcvbuf, and no restore is performed. Returns 0.
  *
  * The caller MUST treat a 0 return as "link is invalid" and not touch
  * the link pointer afterward. */
@@ -4494,6 +4495,10 @@ int clusterProcessPacketBuffer(clusterLink *link, char *buf, size_t len) {
         /* Link is still valid — restore the original rcvbuf. */
         link->rcvbuf = saved_rcvbuf;
         link->rcvbuf_len = saved_rcvbuf_len;
+    } else {
+        /* freeClusterLink() released buf via link->rcvbuf. Release the
+         * original receive buffer we saved before swapping it out. */
+        zfree(saved_rcvbuf);
     }
     /* If ret == 0, the link was freed by clusterProcessPacket.
      * Do not touch the link pointer. */
@@ -4718,7 +4723,7 @@ static void clusterReadOffloadHandler(connection *conn) {
         int ret = clusterProcessPacketBuffer(link, pkt, totlen);
         server.stat_cluster_queued_inbound_packets--;
 
-        if (!ret) return; /* Link freed, pkt was freed via link->rcvbuf */
+        if (!ret) return; /* Link freed; pkt and the saved rcvbuf were released. */
         zfree(pkt);
     }
 
@@ -8840,7 +8845,8 @@ void clusterHandleReadCompletion(clusterLink *link) {
         server.stat_cluster_queued_inbound_packets--;
 
         if (!ret) {
-            /* Link was freed by clusterProcessPacket, which also freed pkt via link->rcvbuf. */
+            /* Link was freed by clusterProcessPacketBuffer, which released
+             * both pkt and the saved original rcvbuf. */
             return;
         }
 
