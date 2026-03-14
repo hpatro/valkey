@@ -26,6 +26,7 @@ static mpscQueue io_shared_outbox = {0};
 static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
 static size_t io_jobs_submitted;
 static atomic_size_t io_jobs_finished;
+static size_t cluster_io_pending_responses;
 static int io_threads_initialized = 0;
 _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
@@ -70,9 +71,9 @@ static size_t getPendingIOThreadsJobs(void) {
     return io_jobs_submitted - atomic_load_explicit(&io_jobs_finished, memory_order_acquire);
 }
 
-/* Read/write jobs awaiting response from IO threads. */
-static int getPendingIOResponsesCount(void) {
-    return server.stat_io_writes_pending + server.stat_io_reads_pending;
+/* Jobs awaiting response from IO threads in the shared outbox path. */
+static size_t getPendingIOResponsesCount(void) {
+    return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -514,6 +515,7 @@ void initIOThreads(int prev_threads_num) {
         mpscInit(&io_shared_outbox);
         io_jobs_submitted = 0;
         atomic_init(&io_jobs_finished, 0);
+        cluster_io_pending_responses = 0;
         prefetchCommandsBatchInit();
         io_threads_initialized = 1;
     }
@@ -668,6 +670,7 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     }
 
     io_jobs_submitted++;
+    cluster_io_pending_responses++;
     server.stat_cluster_reads_offloaded++;
     return C_OK;
 }
@@ -731,6 +734,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
     }
 
     io_jobs_submitted++;
+    cluster_io_pending_responses++;
     server.stat_cluster_writes_offloaded++;
     return C_OK;
 }
@@ -756,6 +760,7 @@ int trySendClusterAcceptToIOThreads(connection *conn) {
     }
 
     io_jobs_submitted++;
+    cluster_io_pending_responses++;
     server.stat_cluster_accepts_offloaded++;
     return C_OK;
 }
@@ -1058,10 +1063,16 @@ int processIOThreadsResponses(void) {
                     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                     write_jobs[write_count++] = c;
                 } else if (job_type == JOB_RES_CLUSTER_READ) {
+                    serverAssert(cluster_io_pending_responses > 0);
+                    cluster_io_pending_responses--;
                     clusterHandleReadCompletion((struct clusterLink *)data);
                 } else if (job_type == JOB_RES_CLUSTER_WRITE) {
+                    serverAssert(cluster_io_pending_responses > 0);
+                    cluster_io_pending_responses--;
                     clusterHandleWriteCompletion((struct clusterLink *)data);
                 } else if (job_type == JOB_RES_CLUSTER_ACCEPT) {
+                    serverAssert(cluster_io_pending_responses > 0);
+                    cluster_io_pending_responses--;
                     clusterHandleAcceptCompletion((connection *)data);
                 } else {
                     serverPanic("Unknown job type %d", job_type);
