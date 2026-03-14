@@ -1784,9 +1784,10 @@ clusterLink *createClusterLink(clusterNode *node) {
  * with this link will have the 'link' field set to NULL.
  *
  * If I/O jobs are in flight (io_refs > 0), the link is not freed immediately.
- * Instead, async_close is set, the link is detached from node fields, and the
- * connection is closed (causing in-flight I/O to fail). The link object is
- * freed later when the last completion decrements io_refs to 0.
+ * Instead, async_close is set, the link is detached from node fields, and any
+ * read/write handlers are removed so no new I/O work is scheduled. The actual
+ * connClose() happens later on the main thread when the last completion
+ * decrements io_refs to 0, mirroring the client close flow.
  *
  * Returns 1 if the link was freed immediately, 0 if teardown was deferred. */
 int freeClusterLink(clusterLink *link) {
@@ -1809,21 +1810,25 @@ int freeClusterLink(clusterLink *link) {
         link->node = NULL;
     }
 
-    /* Close the connection (causes in-flight I/O to fail).
-     * If I/O jobs are in flight, keep link->conn valid until the completion
-     * handler releases its connection ref and we finalize teardown. */
-    if (link->conn) {
-        connClose(link->conn);
-        if (link->io_refs == 0) link->conn = NULL;
-    }
-
     /* If I/O jobs are in flight, defer the actual free. */
     if (link->io_refs > 0) {
         serverAssert(link->io_read_state == CLUSTER_LINK_IO_PENDING ||
                      link->io_write_state == CLUSTER_LINK_IO_PENDING);
-        link->async_close = 1;
-        server.stat_cluster_async_closed_links++;
+        if (!link->async_close) {
+            if (link->conn) {
+                connSetReadHandler(link->conn, NULL);
+                connSetWriteHandler(link->conn, NULL);
+            }
+            link->async_close = 1;
+            server.stat_cluster_async_closed_links++;
+        }
         return 0;
+    }
+
+    /* Close the connection now that no I/O jobs are in flight. */
+    if (link->conn) {
+        connClose(link->conn);
+        link->conn = NULL;
     }
 
     /* Immediate free path — both states must be idle. */
@@ -8760,8 +8765,9 @@ void clusterAcceptJob(connection *conn) {
 void clusterHandleReadCompletion(clusterLink *link) {
     connection *conn = link->conn;
 
-    /* Apply deferred connection state transitions. conn may be NULL if
-     * freeClusterLink was called while the job was in flight (async_close). */
+    /* Apply deferred connection state transitions. Even if freeClusterLink()
+     * was called while the job was in flight, link->conn remains valid until
+     * the final async_close teardown runs after the last completion. */
     if (conn) {
         connSetPostponeUpdateState(conn, 0);
         connUpdateState(conn);
