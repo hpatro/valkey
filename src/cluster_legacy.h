@@ -66,10 +66,10 @@ typedef struct clusterLink {
     int io_refs;                           /* Count of in-flight I/O jobs */
     clusterIOResult io_result;             /* Result code from last I/O job (written by I/O thread) */
 
-    /* Dual send queues for write offload */
-    list *send_msg_queue_inflight;         /* Frozen for one write job */
-    size_t inflight_send_offset;           /* Byte offset into head of inflight queue */
-    int inflight_nodes_sent;               /* Number of fully-sent nodes (set by I/O thread) */
+    /* Async write snapshot/result */
+    listNode *io_last_send_block;          /* Last queue node visible to current write job */
+    size_t io_head_offset;                 /* Snapshot/result offset into queue head */
+    int io_nodes_sent;                     /* Number of fully-sent head nodes (set by I/O thread) */
 
     /* Timestamp for failure detection (cross-thread) */
     _Atomic mstime_t last_io_read_time;    /* Updated by I/O thread on successful read */

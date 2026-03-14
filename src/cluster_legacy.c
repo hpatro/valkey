@@ -1740,12 +1740,10 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->io_refs = 0;
     link->io_result = CLUSTER_IO_OK;
 
-    /* Dual send queues for write offload */
-    link->send_msg_queue_inflight = listCreate();
-    listSetFreeMethod(link->send_msg_queue_inflight, clusterMsgSendBlockDecrRefCount);
-    link->inflight_send_offset = 0;
-    link->inflight_nodes_sent = 0;
-    link->send_msg_queue_mem += sizeof(list); /* Track inflight list */
+    /* Async write snapshot/result */
+    link->io_last_send_block = NULL;
+    link->io_head_offset = 0;
+    link->io_nodes_sent = 0;
 
     /* Failure detection timestamp */
     atomic_store_explicit(&link->last_io_read_time, 0, memory_order_relaxed);
@@ -1820,10 +1818,6 @@ int freeClusterLink(clusterLink *link) {
     serverAssert(link->io_refs == 0);
     server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue) * sizeof(listNode);
     listRelease(link->send_msg_queue);
-
-    /* Clean up dual send queues */
-    server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue_inflight) * sizeof(listNode);
-    listRelease(link->send_msg_queue_inflight);
 
     /* Clean up framed packets */
     server.stat_cluster_links_memory -= link->framed_packets_mem;
@@ -4508,6 +4502,13 @@ void clusterWriteHandler(connection *conn) {
     ssize_t nwritten;
     size_t totwritten = 0;
 
+    if (listLength(link->send_msg_queue) == 0) {
+        connSetWriteHandler(link->conn, NULL);
+        return;
+    }
+
+    if (trySendClusterWriteToIOThreads(link) == C_OK) return;
+
     while (totwritten < NET_MAX_WRITES_PER_EVENT && listLength(link->send_msg_queue) > 0) {
         listNode *head = listFirst(link->send_msg_queue);
         clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
@@ -4541,10 +4542,7 @@ void clusterWriteHandler(connection *conn) {
     }
 
     /* Unregister the write handler when the queue is empty to avoid
-     * burning CPU on spurious writable events. This also covers the
-     * I/O-thread offload case: when trySendClusterWriteToIOThreads()
-     * swaps send_msg_queue to inflight, the queue becomes empty, so
-     * this handler fires once, sees nothing to write, and removes itself. */
+     * burning CPU on spurious writable events. */
     if (listLength(link->send_msg_queue) == 0) connSetWriteHandler(link->conn, NULL);
 }
 
@@ -4830,9 +4828,9 @@ void clusterSendMessage(clusterLink *link, clusterMsgSendBlock *msgblock) {
     uint16_t type = ntohs(getMessageFromSendBlock(msgblock)->type) & ~CLUSTERMSG_MODIFIER_MASK;
     if (type < CLUSTERMSG_TYPE_COUNT) server.cluster->stats_bus_messages_sent[type]++;
 
-    /* Try to offload the write to an I/O thread. The sync write handler
-     * stays installed — if the offload took the data, the handler will
-     * fire, see an empty queue, and remove itself harmlessly. */
+    /* Try to offload the write to an I/O thread. The write handler stays
+     * installed, but while a write job is pending clusterWriteHandler()
+     * will return before doing synchronous I/O. */
     trySendClusterWriteToIOThreads(link);
 }
 
@@ -8660,28 +8658,29 @@ void clusterReadJob(clusterLink *link) {
     sendToMainThread(link, JOB_RES_CLUSTER_READ);
 }
 
-/* I/O thread worker: write bytes from the inflight send queue to the
- * connection, starting at inflight_send_offset.
+/* I/O thread worker: write bytes from the canonical send queue to the
+ * connection, starting at io_head_offset and stopping once it reaches
+ * io_last_send_block.
  *
- * The worker iterates through the inflight list and writes bytes, but
- * does NOT pop nodes or decrement refcounts — clusterMsgSendBlock
- * refcounts are non-atomic and blocks can be shared across links.
- * The worker records how many nodes were fully sent (inflight_nodes_sent)
- * and the byte offset into the next partially-sent node
- * (inflight_send_offset). The main-thread completion handler uses
- * these to pop nodes and update memory accounting. */
+ * The worker does NOT pop nodes or decrement refcounts — clusterMsgSendBlock
+ * refcounts are non-atomic and blocks can be shared across links. The
+ * worker records how many head nodes were fully sent (io_nodes_sent) and
+ * the byte offset into the next partially-sent node (io_head_offset). The
+ * main-thread completion handler uses these to pop nodes and update memory
+ * accounting. */
 void clusterWriteJob(clusterLink *link) {
     connection *conn = link->conn;
     clusterIOResult result = CLUSTER_IO_OK;
     int nodes_sent = 0;
-    listNode *node = listFirst(link->send_msg_queue_inflight);
+    listNode *node = listFirst(link->send_msg_queue);
+    size_t head_offset = link->io_head_offset;
 
     /* I/O thread invariant: we must be in PENDING state. */
     serverAssert(link->io_write_state == CLUSTER_LINK_IO_PENDING);
     serverAssert(link->io_read_state == CLUSTER_LINK_IO_IDLE);
 
     if (conn == NULL) {
-        link->inflight_nodes_sent = 0;
+        link->io_nodes_sent = 0;
         link->io_result = CLUSTER_IO_WRITE_ERROR;
         sendToMainThread(link, JOB_RES_CLUSTER_WRITE);
         return;
@@ -8691,7 +8690,7 @@ void clusterWriteJob(clusterLink *link) {
         clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)node->value;
         clusterMsg *msg = &msgblock->data[0].msg;
         size_t msg_len = ntohl(msg->totlen);
-        size_t msg_offset = link->inflight_send_offset;
+        size_t msg_offset = head_offset;
 
         ssize_t nwritten = connWrite(conn, (char *)msg + msg_offset, msg_len - msg_offset);
         if (nwritten <= 0) {
@@ -8702,18 +8701,20 @@ void clusterWriteJob(clusterLink *link) {
             break;
         }
 
-        link->inflight_send_offset += nwritten;
-        if (link->inflight_send_offset < msg_len) {
+        head_offset += nwritten;
+        if (head_offset < msg_len) {
             break; /* Partial write */
         }
 
         /* Fully sent this message — advance to next. */
-        link->inflight_send_offset = 0;
+        head_offset = 0;
         nodes_sent++;
+        if (node == link->io_last_send_block) break;
         node = listNextNode(node);
     }
 
-    link->inflight_nodes_sent = nodes_sent;
+    link->io_nodes_sent = nodes_sent;
+    link->io_head_offset = head_offset;
     link->io_result = result;
     sendToMainThread(link, JOB_RES_CLUSTER_WRITE);
 }
@@ -8859,19 +8860,24 @@ void clusterHandleWriteCompletion(clusterLink *link) {
     link->io_write_state = CLUSTER_LINK_IO_IDLE;
     link->io_refs--;
 
-    /* Pop fully-sent nodes from the inflight queue. The I/O thread recorded
-     * how many nodes it fully sent (inflight_nodes_sent) without modifying
-     * the list. We pop them here on the main thread where refcount
-     * decrements and memory accounting are safe. */
-    for (int i = 0; i < link->inflight_nodes_sent; i++) {
-        listNode *head = listFirst(link->send_msg_queue_inflight);
+    /* Pop fully-sent nodes from the canonical send queue. The I/O thread
+     * recorded how many nodes it fully sent (io_nodes_sent) without
+     * modifying the list. We pop them here on the main thread where
+     * refcount decrements and memory accounting are safe. */
+    for (int i = 0; i < link->io_nodes_sent; i++) {
+        listNode *head = listFirst(link->send_msg_queue);
         serverAssert(head != NULL);
         clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
         uint32_t blocklen = msgblock->totlen;
-        listDelNode(link->send_msg_queue_inflight, head);
+        listDelNode(link->send_msg_queue, head);
         link->send_msg_queue_mem -= sizeof(listNode) + blocklen;
         server.stat_cluster_links_memory -= sizeof(listNode);
     }
+
+    link->head_msg_send_offset = listLength(link->send_msg_queue) > 0 ? link->io_head_offset : 0;
+    link->io_last_send_block = NULL;
+    link->io_head_offset = 0;
+    link->io_nodes_sent = 0;
 
     /* If the link was already marked for async close, check if we can
      * perform the final free now that io_refs has been decremented. */
@@ -8894,22 +8900,14 @@ void clusterHandleWriteCompletion(clusterLink *link) {
         return;
     }
 
-    /* Reschedule a write job if data remains in inflight or the main send queue.
-     * If offload fails (pool went inactive), move any remaining inflight data
-     * back to send_msg_queue and reinstall the sync write handler. */
-    if (listLength(link->send_msg_queue_inflight) > 0 || listLength(link->send_msg_queue) > 0) {
+    /* Reschedule a write job if data remains in the canonical send queue.
+     * If offload fails (pool went inactive), reinstall the sync write handler. */
+    if (listLength(link->send_msg_queue) > 0) {
         if (trySendClusterWriteToIOThreads(link) == C_ERR && link->conn) {
-            /* Move inflight remainder back to the front of send_msg_queue. */
-            if (listLength(link->send_msg_queue_inflight) > 0) {
-                link->head_msg_send_offset = link->inflight_send_offset;
-                listJoin(link->send_msg_queue_inflight, link->send_msg_queue);
-                /* Swap so inflight (now holding everything) becomes send_msg_queue. */
-                list *tmp = link->send_msg_queue;
-                link->send_msg_queue = link->send_msg_queue_inflight;
-                link->send_msg_queue_inflight = tmp;
-            }
             connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
         }
+    } else if (link->conn && connHasWriteHandler(link->conn)) {
+        connSetWriteHandler(link->conn, NULL);
     }
 }
 

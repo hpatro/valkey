@@ -673,14 +673,17 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
 }
 
 /* Try to offload a cluster link write to an I/O thread.
- * Swaps send_msg_queue→inflight, then enqueues a tagged job onto io_shared_inbox.
- * New messages appended by clusterSendMessage during the write go into
- * send_msg_queue (which receives the old empty inflight list after the swap).
+ * Enqueues a tagged job onto io_shared_inbox after snapshotting the current
+ * head offset and the last queue node visible to the worker. New messages
+ * appended by clusterSendMessage during the write stay queued on the main
+ * thread and are picked up by a later dispatch.
  * Returns C_OK if offloaded or if a job is already pending (to prevent
  *   the caller from falling back to synchronous I/O on a connection
  *   with an in-flight worker job).
  * Returns C_ERR if fallback is needed (pool inactive or spmcEnqueue fails). */
 int trySendClusterWriteToIOThreads(struct clusterLink *link) {
+    listNode *last_send_block;
+
     /* If any I/O job is already in flight for this link, return C_OK
      * so the caller does NOT fall back to synchronous I/O. */
     if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
@@ -698,18 +701,17 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
         return C_ERR;
     }
 
+    last_send_block = listLast(link->send_msg_queue);
+    serverAssert(last_send_block != NULL);
+
     /* Postpone connection state updates while the I/O thread operates. */
     connSetPostponeUpdateState(link->conn, 1);
     connIncrRefs(link->conn);
 
-    /* O(1) swap: send_msg_queue becomes inflight, send_msg_queue gets the
-     * (empty) old inflight list. New messages during the write go into
-     * send_msg_queue without touching inflight. */
-    list *tmp = link->send_msg_queue_inflight;
-    link->send_msg_queue_inflight = link->send_msg_queue;
-    link->send_msg_queue = tmp;
-    link->inflight_send_offset = 0;
-    link->inflight_nodes_sent = 0;
+    /* Snapshot the canonical queue for one write job. */
+    link->io_last_send_block = last_send_block;
+    link->io_head_offset = link->head_msg_send_offset;
+    link->io_nodes_sent = 0;
 
     /* Transition link to pending-write state. */
     link->io_write_state = CLUSTER_LINK_IO_PENDING;
@@ -717,12 +719,11 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
 
     /* Enqueue the write job. */
     if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_CLUSTER_WRITE)) == false)) {
-        /* Rollback: swap back. */
-        tmp = link->send_msg_queue_inflight;
-        link->send_msg_queue_inflight = link->send_msg_queue;
-        link->send_msg_queue = tmp;
         link->io_write_state = CLUSTER_LINK_IO_IDLE;
         link->io_refs--;
+        link->io_last_send_block = NULL;
+        link->io_head_offset = 0;
+        link->io_nodes_sent = 0;
         connDecrRefs(link->conn);
         connSetPostponeUpdateState(link->conn, 0);
         server.stat_cluster_io_sync_fallbacks++;
