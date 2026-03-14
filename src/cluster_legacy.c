@@ -4847,9 +4847,10 @@ void clusterSendMessage(clusterLink *link, clusterMsgSendBlock *msgblock) {
     if (!link) {
         return;
     }
-    /* Only install the sync write handler if no I/O write job is in flight.
-     * If a write job is in flight, the completion handler will reschedule
-     * or reinstall the sync handler as needed. */
+    /* Only install the write handler if no I/O write job is in flight.
+     * If a write job is in flight, the completion handler will keep or
+     * reinstall the handler so the next writable event can drive another
+     * offload or synchronous fallback. */
     if (link->io_write_state == CLUSTER_LINK_IO_IDLE && listLength(link->send_msg_queue) == 0 &&
         getMessageFromSendBlock(msgblock)->totlen != 0)
         connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
@@ -8902,10 +8903,11 @@ void clusterHandleWriteCompletion(clusterLink *link) {
         return;
     }
 
-    /* Reschedule a write job if data remains in the canonical send queue.
-     * If offload fails (pool went inactive), reinstall the sync write handler. */
+    /* If data remains, wait for the next writable event before attempting
+     * another offload. This avoids a tight completion -> offload loop when
+     * the transport reports EAGAIN with no write progress. */
     if (listLength(link->send_msg_queue) > 0) {
-        if (trySendClusterWriteToIOThreads(link) == C_ERR && link->conn) {
+        if (link->conn) {
             connSetWriteHandlerWithBarrier(link->conn, clusterWriteHandler, 1);
         }
     } else if (link->conn && connHasWriteHandler(link->conn)) {
