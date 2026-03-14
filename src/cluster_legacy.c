@@ -1723,6 +1723,20 @@ static void clusterMsgSendBlockDecrRefCount(void *node) {
     }
 }
 
+static void clusterFreeFramedPackets(clusterLink *link) {
+    unsigned long packet_count = listLength(link->framed_packets);
+
+    server.stat_cluster_links_memory -= link->framed_packets_mem;
+    server.stat_cluster_queued_inbound_packets -= packet_count;
+
+    listNode *ln;
+    while ((ln = listFirst(link->framed_packets)) != NULL) {
+        zfree(ln->value);
+        listDelNode(link->framed_packets, ln);
+    }
+    link->framed_packets_mem = 0;
+}
+
 clusterLink *createClusterLink(clusterNode *node) {
     clusterLink *link = zmalloc(sizeof(*link));
     link->ctime = mstime();
@@ -1820,7 +1834,7 @@ int freeClusterLink(clusterLink *link) {
     listRelease(link->send_msg_queue);
 
     /* Clean up framed packets */
-    server.stat_cluster_links_memory -= link->framed_packets_mem;
+    clusterFreeFramedPackets(link);
     listRelease(link->framed_packets);
 
     server.stat_cluster_links_memory -= link->rcvbuf_alloc;
@@ -8770,15 +8784,7 @@ void clusterHandleReadCompletion(clusterLink *link) {
      * perform the final free now that io_refs has been decremented. */
     if (link->async_close) {
         if (link->io_refs == 0) {
-            /* Subtract framed_packets_mem we just added, then free packets. */
-            server.stat_cluster_links_memory -= link->framed_packets_mem;
-            server.stat_cluster_queued_inbound_packets -= listLength(link->framed_packets);
-            listNode *ln;
-            while ((ln = listFirst(link->framed_packets)) != NULL) {
-                zfree(ln->value);
-                listDelNode(link->framed_packets, ln);
-            }
-            link->framed_packets_mem = 0;
+            clusterFreeFramedPackets(link);
             freeClusterLink(link);
         }
         return;
