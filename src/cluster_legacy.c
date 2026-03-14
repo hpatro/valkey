@@ -4681,10 +4681,10 @@ static inline int isClusterMsgSignatureAndLengthValid(clusterMsgHeader *hdr) {
  * clusterState, or any main-thread structure.
  **/
 void clusterFramePackets(char *rcvbuf,
-                        size_t rcvbuf_len,
-                        size_t *consumed,
-                        list *framed_packets,
-                        clusterIOResult *result) {
+                         size_t rcvbuf_len,
+                         size_t *consumed,
+                         list *framed_packets,
+                         clusterIOResult *result) {
     size_t offset = 0;
 
     *consumed = 0;
@@ -8805,7 +8805,6 @@ void clusterHandleReadCompletion(clusterLink *link) {
      * perform the final free now that io_refs has been decremented. */
     if (link->async_close) {
         if (link->io_refs == 0) {
-            clusterFreeFramedPackets(link);
             freeClusterLink(link);
         }
         return;
