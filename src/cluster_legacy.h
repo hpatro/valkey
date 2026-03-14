@@ -60,28 +60,28 @@ typedef struct clusterLink {
     int flags;                             /* CLUSTER_LINK_... */
 
     /* Threaded I/O state (main-thread owned, except where noted) */
-    int io_read_state;                     /* clusterLinkIOState: read job state */
-    int io_write_state;                    /* clusterLinkIOState: write job state */
-    int async_close;                       /* 1 if teardown requested while jobs in flight */
-    int io_refs;                           /* Count of in-flight I/O jobs */
-    clusterIOResult io_result;             /* Result code from last I/O job (written by I/O thread).
-                                            * Shared by read/write jobs because they are mutually exclusive per link. */
+    int io_read_state;         /* clusterLinkIOState: read job state */
+    int io_write_state;        /* clusterLinkIOState: write job state */
+    int async_close;           /* 1 if teardown requested while jobs in flight */
+    int io_refs;               /* Count of in-flight I/O jobs */
+    clusterIOResult io_result; /* Result code from last I/O job (written by I/O thread).
+                                * Shared by read/write jobs because they are mutually exclusive per link. */
 
     /* Async write snapshot/result */
-    listNode *io_last_send_block;          /* Last queue node visible to current write job */
-    size_t io_head_offset;                 /* Snapshot/result offset into queue head */
-    int io_nodes_sent;                     /* Number of fully-sent head nodes (set by I/O thread) */
+    listNode *io_last_send_block; /* Last queue node visible to current write job */
+    size_t io_head_offset;        /* Snapshot/result offset into queue head */
+    int io_nodes_sent;            /* Number of fully-sent head nodes (set by I/O thread) */
 
     /* Timestamp for failure detection (cross-thread) */
-    _Atomic mstime_t last_io_read_time;    /* Updated by I/O thread on successful read */
+    _Atomic mstime_t last_io_read_time; /* Updated by I/O thread on successful read */
 
     /* Pre-dispatch rcvbuf_alloc for memory accounting on completion */
-    size_t rcvbuf_alloc_at_dispatch;       /* rcvbuf_alloc when read job was dispatched */
+    size_t rcvbuf_alloc_at_dispatch; /* rcvbuf_alloc when read job was dispatched */
 
     /* Framed packet queue for read offload */
-    list *framed_packets;                  /* List of framed packet buffers */
-    size_t framed_packets_mem;             /* Sum of framed packet payload bytes queued in framed_packets.
-                                            * Used for accounting/limits, not allocator-exact usage. */
+    list *framed_packets;      /* List of framed packet buffers */
+    size_t framed_packets_mem; /* Sum of framed packet payload bytes queued in framed_packets.
+                                * Used for accounting/limits, not allocator-exact usage. */
 } clusterLink;
 
 /* Cluster link flags and macros. */

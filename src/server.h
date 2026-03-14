@@ -1921,12 +1921,12 @@ struct valkeyServer {
     double stat_module_progress;                        /* Module save progress. */
     size_t stat_clients_type_memory[CLIENT_TYPE_COUNT]; /* Mem usage by type */
     size_t stat_cluster_links_memory;                   /* Mem usage by cluster links */
-    long long stat_cluster_reads_offloaded;              /* Cluster reads offloaded to I/O threads */
-    long long stat_cluster_writes_offloaded;             /* Cluster writes offloaded to I/O threads */
-    long long stat_cluster_accepts_offloaded;            /* Cluster accepts offloaded to I/O threads */
-    long long stat_cluster_io_sync_fallbacks;            /* Cluster I/O ops that fell back to sync */
-    long long stat_cluster_async_closed_links;           /* Cluster links deferred-freed via async_close */
-    long long stat_cluster_queued_inbound_packets;       /* Framed packets awaiting main-thread application */
+    long long stat_cluster_reads_offloaded;             /* Cluster reads offloaded to I/O threads */
+    long long stat_cluster_writes_offloaded;            /* Cluster writes offloaded to I/O threads */
+    long long stat_cluster_accepts_offloaded;           /* Cluster accepts offloaded to I/O threads */
+    long long stat_cluster_io_sync_fallbacks;           /* Cluster I/O ops that fell back to sync */
+    long long stat_cluster_async_closed_links;          /* Cluster links deferred-freed via async_close */
+    long long stat_cluster_queued_inbound_packets;      /* Framed packets awaiting main-thread application */
     long long
         stat_unexpected_error_replies;                 /* Number of unexpected (aof-loading, replica to primary, etc.) error replies */
     long long stat_total_error_replies;                /* Total number of issued error replies ( command + rejected errors ) */

@@ -64,8 +64,8 @@ typedef enum {
 /* Identifies the type of owner stored in conn->private_data.
  * Used by connection-layer safety assertions to avoid unsafe casts. */
 typedef enum {
-    CONN_OWNER_CLIENT = 0,       /* private_data points to a client (default) */
-    CONN_OWNER_CLUSTER_LINK,     /* private_data points to a clusterLink */
+    CONN_OWNER_CLIENT = 0,   /* private_data points to a client (default) */
+    CONN_OWNER_CLUSTER_LINK, /* private_data points to a clusterLink */
 } ConnOwnerKind;
 
 #define CONN_FLAG_CLOSE_SCHEDULED (1 << 0)      /* Closed scheduled by a handler */

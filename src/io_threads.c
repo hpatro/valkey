@@ -317,8 +317,8 @@ static void *IOThreadMain(void *myid) {
         work_start_time = getMonotonicUs();
         if (processed != 0) {
             atomic_fetch_add_explicit(&used_active_time_io_thread[id],
-                                        work_start_time - prev_work_start_time,
-                                        memory_order_relaxed);
+                                      work_start_time - prev_work_start_time,
+                                      memory_order_relaxed);
         }
         processed = 0;
         /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
@@ -390,7 +390,7 @@ static void *IOThreadMain(void *myid) {
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
-                //ak-todo: check if flushing needs to be included
+                // ak-todo: check if flushing needs to be included
                 flushPendingIOResponses(0);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
