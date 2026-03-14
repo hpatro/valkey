@@ -8915,6 +8915,14 @@ void clusterHandleAcceptCompletion(connection *conn) {
     connUpdateState(conn);
     connDecrRefs(conn);
 
+    /* TLS handshake may still be in progress (SSL_accept needs more
+     * event-loop iterations). Leave the connection open — the TLS event
+     * handler will continue the handshake. This mirrors the client-side
+     * pattern in processClientIOReadsDone (networking.c). */
+    if (connGetState(conn) == CONN_STATE_ACCEPTING) {
+        return;
+    }
+
     if (connGetState(conn) != CONN_STATE_CONNECTED) {
         serverLog(LL_VERBOSE, "Error accepting cluster node connection: %s", connGetLastError(conn));
         connClose(conn);
