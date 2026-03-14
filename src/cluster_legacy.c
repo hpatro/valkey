@@ -62,8 +62,6 @@
  * that represents this node. */
 clusterNode *myself = NULL;
 
-extern int ProcessingEventsWhileBlocked;
-
 clusterNode *createClusterNode(char *nodename, int flags);
 void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -4510,6 +4508,38 @@ int clusterProcessPacketBuffer(clusterLink *link, char *buf, size_t len) {
     return ret;
 }
 
+/* Drain framed packets queued on a link.
+ *
+ * Returns 1 if the link is still valid after all packets were applied, or
+ * 0 if packet processing freed the link. */
+static int clusterDrainFramedPackets(clusterLink *link) {
+    listNode *ln;
+    while ((ln = listFirst(link->framed_packets)) != NULL) {
+        char *pkt = ln->value;
+        clusterMsgHeader *hdr = (clusterMsgHeader *)pkt;
+        uint32_t totlen = ntohl(hdr->totlen);
+
+        /* Remove from list and update memory accounting before processing,
+         * since clusterProcessPacketBuffer may free the link. */
+        listDelNode(link->framed_packets, ln);
+        link->framed_packets_mem -= totlen;
+        server.stat_cluster_links_memory -= totlen;
+
+        int ret = clusterProcessPacketBuffer(link, pkt, totlen);
+        server.stat_cluster_queued_inbound_packets--;
+
+        if (!ret) {
+            /* Link was freed by clusterProcessPacketBuffer, which released
+             * both pkt and the saved original rcvbuf. */
+            return 0;
+        }
+
+        zfree(pkt);
+    }
+
+    return 1;
+}
+
 /* This function is called when we detect the link with this node is lost.
    We set the node as no longer connected. The Cluster Cron will detect
    this connection and will try to get it connected again.
@@ -4702,7 +4732,7 @@ int clusterFramePackets(char *rcvbuf,
 /* Cluster readable event handler: try to offload the read to an I/O thread.
  * If offload is unavailable (pool inactive, queue full), fall back to the
  * synchronous clusterReadHandler.
- * First drains any leftover framed packets from a previous bounded application. */
+ * First defensively drains any leftover framed packets before reading more. */
 static void clusterReadOffloadHandler(connection *conn) {
     clusterLink *link = connGetPrivateData(conn);
 
@@ -4712,25 +4742,7 @@ static void clusterReadOffloadHandler(connection *conn) {
      * to idle. */
     if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return;
 
-    /* Drain leftover framed packets before dispatching a new read or
-     * falling back to sync. These are packets framed by a previous I/O
-     * thread read that weren't fully applied due to the per-iteration budget. */
-    while (listLength(link->framed_packets) > 0) {
-        listNode *ln = listFirst(link->framed_packets);
-        char *pkt = ln->value;
-        clusterMsgHeader *hdr = (clusterMsgHeader *)pkt;
-        uint32_t totlen = ntohl(hdr->totlen);
-
-        listDelNode(link->framed_packets, ln);
-        link->framed_packets_mem -= totlen;
-        server.stat_cluster_links_memory -= totlen;
-
-        int ret = clusterProcessPacketBuffer(link, pkt, totlen);
-        server.stat_cluster_queued_inbound_packets--;
-
-        if (!ret) return; /* Link freed; pkt and the saved rcvbuf were released. */
-        zfree(pkt);
-    }
+    if (!clusterDrainFramedPackets(link)) return;
 
     if (trySendClusterReadToIOThreads(link) == C_ERR) {
         clusterReadHandler(conn);
@@ -8823,45 +8835,12 @@ void clusterHandleReadCompletion(clusterLink *link) {
                   link->inbound ? "inbound" : "outbound",
                   clusterLinkGetHumanNodeName(link),
                   (result == CLUSTER_IO_EOF) ? "connection closed" : "read error");
-        freeClusterLink(link);
-        return;
     }
 
-    /* Success path: apply framed packets.
-     * Normal path: up to 64 packets or 250µs.
-     * Blocked path: up to 8 packets or 50µs. */
-    int max_packets = ProcessingEventsWhileBlocked ? 8 : 64;
-    long long max_usec = ProcessingEventsWhileBlocked ? 50 : 250;
-    monotime start = 0;
-    elapsedStart(&start);
-    int applied = 0;
+    if (!clusterDrainFramedPackets(link)) return;
 
-    listNode *ln;
-    while ((ln = listFirst(link->framed_packets)) != NULL) {
-        if (applied >= max_packets) break;
-        if (applied > 0 && (long long)elapsedUs(start) >= max_usec) break;
-
-        char *pkt = ln->value;
-        clusterMsgHeader *hdr = (clusterMsgHeader *)pkt;
-        uint32_t totlen = ntohl(hdr->totlen);
-
-        /* Remove from list and update memory accounting before processing,
-         * since clusterProcessPacketBuffer may free the link. */
-        listDelNode(link->framed_packets, ln);
-        link->framed_packets_mem -= totlen;
-        server.stat_cluster_links_memory -= totlen;
-
-        int ret = clusterProcessPacketBuffer(link, pkt, totlen);
-        server.stat_cluster_queued_inbound_packets--;
-
-        if (!ret) {
-            /* Link was freed by clusterProcessPacketBuffer, which released
-             * both pkt and the saved original rcvbuf. */
-            return;
-        }
-
-        zfree(pkt);
-        applied++;
+    if (result == CLUSTER_IO_READ_ERROR || result == CLUSTER_IO_EOF) {
+        freeClusterLink(link);
     }
 }
 
