@@ -8590,7 +8590,10 @@ bool isAnySlotInManualMigratingState(void) {
 
 /* ===================== Cluster I/O Thread Worker Functions ==================
  * These run on I/O threads. They must NOT touch clusterNode, clusterState,
- * server.stat_cluster_links_memory, or any main-thread-only structure. */
+ * server.stat_cluster_links_memory, or any main-thread-only structure.
+ *
+ * Read and write jobs are mutually exclusive per link, so the shared
+ * io_result field still has only one writer at a time. */
 
 /* I/O thread worker: read bytes from a cluster link's connection, grow the
  * receive buffer as needed, frame packets, and post a completion.
@@ -8656,7 +8659,8 @@ void clusterReadJob(clusterLink *link) {
         clusterFramePackets(link->rcvbuf, link->rcvbuf_len, &consumed,
                             link->framed_packets, 16, 65536, &frame_result);
 
-        /* Compact the receive buffer and track framed packet memory. */
+        /* Compact the receive buffer and track queued framed packet payload
+         * bytes for accounting. This is not allocator-exact memory usage. */
         if (consumed > 0) {
             link->framed_packets_mem = consumed;
             memmove(link->rcvbuf, link->rcvbuf + consumed, link->rcvbuf_len - consumed);

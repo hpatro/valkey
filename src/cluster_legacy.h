@@ -64,7 +64,8 @@ typedef struct clusterLink {
     int io_write_state;                    /* clusterLinkIOState: write job state */
     int async_close;                       /* 1 if teardown requested while jobs in flight */
     int io_refs;                           /* Count of in-flight I/O jobs */
-    clusterIOResult io_result;             /* Result code from last I/O job (written by I/O thread) */
+    clusterIOResult io_result;             /* Result code from last I/O job (written by I/O thread).
+                                            * Shared by read/write jobs because they are mutually exclusive per link. */
 
     /* Async write snapshot/result */
     listNode *io_last_send_block;          /* Last queue node visible to current write job */
@@ -79,7 +80,8 @@ typedef struct clusterLink {
 
     /* Framed packet queue for read offload */
     list *framed_packets;                  /* List of framed packet buffers */
-    size_t framed_packets_mem;             /* Memory in bytes used by framed_packets */
+    size_t framed_packets_mem;             /* Sum of framed packet payload bytes queued in framed_packets.
+                                            * Used for accounting/limits, not allocator-exact usage. */
 } clusterLink;
 
 /* Cluster link flags and macros. */
