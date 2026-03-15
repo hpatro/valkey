@@ -1876,6 +1876,9 @@ static void clusterConnAcceptHandler(connection *conn) {
         return;
     }
 
+    serverAssert(connGetOwnerKind(conn) == CONN_OWNER_CLUSTER_LINK);
+    serverAssert(connGetPrivateData(conn) == NULL);
+
     /* Create a link object we use to handle the connection.
      * It gets passed to the readable handler when data is available.
      * Initially the link->node pointer is set to NULL as we don't know
