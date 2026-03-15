@@ -4673,8 +4673,7 @@ static inline int isClusterMsgSignatureAndLengthValid(clusterMsgHeader *hdr) {
 /* Frame packets from raw bytes in rcvbuf.
  *
  * Scans the buffer for complete cluster messages by validating the signature
- * ("RCmb"), minimum header length, and total length field. Stops at max_packets
- * or max_bytes, whichever limit is reached first.
+ * ("RCmb"), minimum header length, and total length field.
  *
  * For each complete packet found, a copy of the packet bytes is allocated and
  * appended to framed_packets. The caller is responsible for freeing these buffers.

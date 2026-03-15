@@ -638,9 +638,9 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     /* Invariant: io_refs must be 0 when both states are IDLE. */
     serverAssert(link->io_refs == 0);
 
-    /* Don't dispatch a new read if there are unapplied framed packets
-     * from a previous bounded application. The readable event will keep
-     * firing; the offload handler falls back to sync which drains them. */
+    /* Don't dispatch a new read if there are unapplied framed packets.
+     * The readable event will keep firing; the offload handler falls back
+     * to sync, which drains them first. */
     if (listLength(link->framed_packets) > 0) return C_ERR;
 
     /* No I/O thread pool available — synchronous fallback. */

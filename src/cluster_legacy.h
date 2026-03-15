@@ -42,7 +42,6 @@ typedef enum {
     CLUSTER_IO_READ_ERROR,
     CLUSTER_IO_EOF,
     CLUSTER_IO_WRITE_ERROR,
-    CLUSTER_IO_ACCEPT_ERROR,
 } clusterIOResult;
 
 /* clusterLink encapsulates everything needed to talk with a remote node. */
