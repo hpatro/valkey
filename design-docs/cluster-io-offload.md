@@ -25,7 +25,7 @@ I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
 |                           |
 | processIOThreadsResponses |<------ io_shared_outbox (MPSC) <------ sendToMainThread(...)
 | clusterHandle*Completion  |
-| clusterProcessPacketBuffer|
+| clusterProcessPacket      |
 | freeClusterLink           |
 +---------------------------+
 ```
@@ -37,17 +37,18 @@ I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
 3. Main thread alone applies cluster packets and mutates cluster state.
 4. Write offload uses a single canonical `send_msg_queue` plus a snapshot boundary:
    `io_last_send_block`, `io_head_offset`, and `io_nodes_sent`.
-5. Read completion drains `framed_packets` fully; there is no bounded packet/time budget.
-6. Link teardown is deferred with `io_refs` and `async_close`.
-7. Accept offload is serialized per connection with `CONN_FLAG_ACCEPT_OFFLOAD_PENDING`.
-8. `ConnOwnerKind` lets generic connection/TLS code distinguish client-owned and cluster-owned connections safely.
+5. Read offload uses `rcvbuf` snapshot boundaries: `io_rcvbuf_snapshot_len` and `io_rcvbuf_snapshot_packets`.
+6. Read completion drains the queued `rcvbuf` snapshot fully; there is no bounded packet/time budget.
+7. Link teardown is deferred with `io_refs` and `async_close`.
+8. Accept offload is serialized per connection with `CONN_FLAG_ACCEPT_OFFLOAD_PENDING`.
+9. `ConnOwnerKind` lets generic connection/TLS code distinguish client-owned and cluster-owned connections safely.
 
 ## Data Flow: Read Path
 
 ```text
 [MAIN dispatch] clusterReadOffloadHandler
     |
-    | drain leftovers
+    | drain queued snapshot
     | trySendClusterReadToIOThreads()
     v
 [QUEUE] io_shared_inbox
@@ -56,8 +57,8 @@ I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
 [IO worker] clusterReadJob
     | connRead() into rcvbuf
     | grow rcvbuf if needed
-    | frame packets into framed_packets
-    | compact rcvbuf
+    | snapshot complete packet prefix
+    | set io_rcvbuf_snapshot_len / packets
     | set io_result
     v
 [QUEUE] io_shared_outbox
@@ -67,7 +68,7 @@ I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
     | set io_read_state = IDLE
     | io_refs--
     | reconcile memory
-    | drain framed_packets fully
+    | drain queued rcvbuf snapshot fully
     | shrink/free as needed
 ```
 
@@ -167,13 +168,14 @@ Read and write jobs are mutually exclusive per link.
 - `io_refs == 0` implies both `io_read_state` and `io_write_state` are IDLE.
 - Read and write jobs are mutually exclusive.
 - `send_msg_queue_mem` tracks the canonical `send_msg_queue`.
+- Link buffer-limit accounting currently uses `send_msg_queue_mem + rcvbuf_len`.
 - `stat_cluster_links_memory` is updated on the main thread.
 
 ### I/O Thread MAY
 
 - Call `connRead()` / `connWrite()` / `connAccept()` on the offloaded connection.
 - Grow `rcvbuf` and update `rcvbuf_len` / `rcvbuf_alloc`.
-- Append framed packet buffers to `framed_packets`.
+- Scan `rcvbuf` and publish `io_rcvbuf_snapshot_len` / `io_rcvbuf_snapshot_packets`.
 - Read `send_msg_queue` up to the snapped `io_last_send_block`.
 - Write `io_result`, `io_nodes_sent`, `io_head_offset`, and `last_io_read_time`.
 - Publish completions with `sendToMainThread()`.
@@ -189,7 +191,7 @@ Read and write jobs are mutually exclusive per link.
 
 ### Main Thread MUST NOT While a Job Is In Flight
 
-- For read: touch `rcvbuf`, `rcvbuf_len`, `rcvbuf_alloc`, `framed_packets`, or `framed_packets_mem`.
+- For read: touch `rcvbuf`, `rcvbuf_len`, `rcvbuf_alloc`, `io_rcvbuf_snapshot_len`, or `io_rcvbuf_snapshot_packets`.
 - For write: pop already-visible queue nodes or rewrite the tracked head send offset.
 - Dispatch a second read/write job for the same link.
 
@@ -238,7 +240,20 @@ loads it with acquire ordering.
 | Result / Condition | Handling |
 |--------------------|----------|
 | `CLUSTER_IO_BAD_HEADER` / `CLUSTER_IO_BAD_LENGTH` | Log warning, free link immediately |
-| `CLUSTER_IO_READ_ERROR` / `CLUSTER_IO_EOF` | Log debug, drain framed packets, then free link |
+| `CLUSTER_IO_READ_ERROR` / `CLUSTER_IO_EOF` | Log debug, drain queued `rcvbuf` snapshot, then free link |
 | `CLUSTER_IO_WRITE_ERROR` | Log debug, free link |
 | `CONN_STATE_ACCEPTING` after accept completion | Leave connection open; TLS event flow will retry |
 | Pool inactive / queue full | Sync fallback + increment `stat_cluster_io_sync_fallbacks` |
+
+## Follow-Up
+
+- Read completion currently drains the queued `rcvbuf` snapshot in one pass on the
+  main thread and compacts the buffer after each packet.
+- Follow-up work: either reintroduce bounded completion with a correct continuation
+  mechanism, or keep full drain semantics but switch to a front-offset model so we
+  avoid repeated per-packet `memmove()` while a large burst is being applied.
+- Current behavior on `CLUSTER_IO_BAD_HEADER` / `CLUSTER_IO_BAD_LENGTH` is to close
+  the link immediately, even if the same offloaded read also contained a valid
+  packet prefix in the queued snapshot. This is accepted for now as an invalid-peer
+  path, but if we ever need sync/offload parity here, read completion should drain
+  the valid prefix before tearing the link down.
