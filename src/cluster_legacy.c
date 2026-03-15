@@ -6168,7 +6168,8 @@ static void freeClusterLinkOnBufferLimitReached(clusterLink *link) {
         return;
     }
 
-    unsigned long long mem_link = link->send_msg_queue_mem + link->rcvbuf_len;
+    unsigned long long mem_link = link->send_msg_queue_mem +
+                                  atomic_load_explicit(&link->rcvbuf_len, memory_order_relaxed);
     if (mem_link > server.cluster_link_msg_queue_limit_bytes) {
         serverLog(LL_WARNING,
                   "Freeing cluster link(%s node %.40s (%s), used memory: %llu) due to "
@@ -6179,7 +6180,7 @@ static void freeClusterLinkOnBufferLimitReached(clusterLink *link) {
     }
 }
 
-/* Free outbound link to a node if its send buffer size exceeded limit. */
+/* Free a link to a node if its buffer size exceeded limit. */
 static void clusterNodeCronFreeLinkOnBufferLimitReached(clusterNode *node) {
     freeClusterLinkOnBufferLimitReached(node->link);
     freeClusterLinkOnBufferLimitReached(node->inbound_link);
