@@ -1721,18 +1721,10 @@ static void clusterMsgSendBlockDecrRefCount(void *node) {
     }
 }
 
-static void clusterFreeFramedPackets(clusterLink *link) {
-    unsigned long packet_count = listLength(link->framed_packets);
-
-    server.stat_cluster_links_memory -= link->framed_packets_mem;
-    server.stat_cluster_queued_inbound_packets -= packet_count;
-
-    listNode *ln;
-    while ((ln = listFirst(link->framed_packets)) != NULL) {
-        zfree(ln->value);
-        listDelNode(link->framed_packets, ln);
-    }
-    link->framed_packets_mem = 0;
+static void clusterResetRcvbufSnapshot(clusterLink *link) {
+    server.stat_cluster_queued_inbound_packets -= link->io_rcvbuf_snapshot_packets;
+    link->io_rcvbuf_snapshot_len = 0;
+    link->io_rcvbuf_snapshot_packets = 0;
 }
 
 clusterLink *createClusterLink(clusterNode *node) {
@@ -1760,10 +1752,9 @@ clusterLink *createClusterLink(clusterNode *node) {
     /* Failure detection timestamp */
     atomic_store_explicit(&link->last_io_read_time, 0, memory_order_relaxed);
 
-    /* Framed packet queue */
-    link->framed_packets = listCreate();
-    link->framed_packets_mem = 0;
     link->rcvbuf_alloc_at_dispatch = 0;
+    link->io_rcvbuf_snapshot_len = 0;
+    link->io_rcvbuf_snapshot_packets = 0;
 
     server.stat_cluster_links_memory += link->rcvbuf_alloc + link->send_msg_queue_mem;
     link->conn = NULL;
@@ -1836,9 +1827,8 @@ int freeClusterLink(clusterLink *link) {
     server.stat_cluster_links_memory -= sizeof(list) + listLength(link->send_msg_queue) * sizeof(listNode);
     listRelease(link->send_msg_queue);
 
-    /* Clean up framed packets */
-    clusterFreeFramedPackets(link);
-    listRelease(link->framed_packets);
+    /* Clear any queued read snapshot that was accounted for on completion. */
+    clusterResetRcvbufSnapshot(link);
 
     server.stat_cluster_links_memory -= link->rcvbuf_alloc;
     zfree(link->rcvbuf);
@@ -4472,73 +4462,34 @@ int clusterProcessPacket(clusterLink *link) {
     return 1;
 }
 
-/* Apply a single framed cluster packet from an explicit buffer.
+/* Drain complete packets queued at the start of rcvbuf.
  *
- * This is the main-thread-only entry point for processing packets produced
- * by the framing layer (whether on an I/O thread or synchronously).
- *
- * Saves link->rcvbuf/rcvbuf_len, replaces them with buf/len, calls
- * clusterProcessPacket(), then:
- *   - If clusterProcessPacket() returns 1 (link still valid): restores
- *     the saved rcvbuf/rcvbuf_len and returns 1.
- *   - If clusterProcessPacket() returns 0 (link freed): frees the saved
- *     original rcvbuf because freeClusterLink() released buf via
- *     link->rcvbuf, and no restore is performed. Returns 0.
- *
- * The caller MUST treat a 0 return as "link is invalid" and not touch
- * the link pointer afterward. */
-int clusterProcessPacketBuffer(clusterLink *link, char *buf, size_t len) {
-    /* Save the current rcvbuf state. */
-    char *saved_rcvbuf = link->rcvbuf;
-    size_t saved_rcvbuf_len = link->rcvbuf_len;
-
-    /* Temporarily replace rcvbuf with the explicit buffer. */
-    link->rcvbuf = buf;
-    link->rcvbuf_len = len;
-
-    int ret = clusterProcessPacket(link);
-
-    if (ret) {
-        /* Link is still valid — restore the original rcvbuf. */
-        link->rcvbuf = saved_rcvbuf;
-        link->rcvbuf_len = saved_rcvbuf_len;
-    } else {
-        /* freeClusterLink() released buf via link->rcvbuf. Release the
-         * original receive buffer we saved before swapping it out. */
-        zfree(saved_rcvbuf);
-    }
-    /* If ret == 0, the link was freed by clusterProcessPacket.
-     * Do not touch the link pointer. */
-    return ret;
-}
-
-/* Drain framed packets queued on a link.
+ * io_rcvbuf_snapshot_len marks the bytes the I/O thread determined contain
+ * only complete packets. The main thread processes those packets in place,
+ * removing each one from the front of rcvbuf after it is applied.
  *
  * Returns 1 if the link is still valid after all packets were applied, or
  * 0 if packet processing freed the link. */
-static int clusterDrainFramedPackets(clusterLink *link) {
-    listNode *ln;
-    while ((ln = listFirst(link->framed_packets)) != NULL) {
-        char *pkt = ln->value;
-        clusterMsgHeader *hdr = (clusterMsgHeader *)pkt;
+static int clusterDrainRcvbufSnapshot(clusterLink *link) {
+    while (link->io_rcvbuf_snapshot_len > 0) {
+        clusterMsgHeader *hdr = (clusterMsgHeader *)link->rcvbuf;
         uint32_t totlen = ntohl(hdr->totlen);
+        size_t saved_rcvbuf_len = link->rcvbuf_len;
 
-        /* Remove from list and update memory accounting before processing,
-         * since clusterProcessPacketBuffer may free the link. */
-        listDelNode(link->framed_packets, ln);
-        link->framed_packets_mem -= totlen;
-        server.stat_cluster_links_memory -= totlen;
+        serverAssert(link->io_rcvbuf_snapshot_len >= totlen);
+        serverAssert(link->io_rcvbuf_snapshot_packets > 0);
 
-        int ret = clusterProcessPacketBuffer(link, pkt, totlen);
+        link->io_rcvbuf_snapshot_len -= totlen;
+        link->io_rcvbuf_snapshot_packets--;
         server.stat_cluster_queued_inbound_packets--;
 
-        if (!ret) {
-            /* Link was freed by clusterProcessPacketBuffer, which released
-             * both pkt and the saved original rcvbuf. */
+        link->rcvbuf_len = totlen;
+        if (!clusterProcessPacket(link)) {
             return 0;
         }
 
-        zfree(pkt);
+        memmove(link->rcvbuf, link->rcvbuf + totlen, saved_rcvbuf_len - totlen);
+        link->rcvbuf_len = saved_rcvbuf_len - totlen;
     }
 
     return 1;
@@ -4670,26 +4621,25 @@ static inline int isClusterMsgSignatureAndLengthValid(clusterMsgHeader *hdr) {
     return 1;
 }
 
-/* Frame packets from raw bytes in rcvbuf.
+/* Find the maximal prefix of rcvbuf that contains only complete packets.
  *
- * Scans the buffer for complete cluster messages by validating the signature
- * ("RCmb"), minimum header length, and total length field.
+ * Scans the buffer by validating the signature ("RCmb"), minimum header
+ * length, and total length field. snapshot_len is the number of bytes at the
+ * start of rcvbuf that contain complete packets, and packet_count is the
+ * number of packets in that prefix.
  *
- * For each complete packet found, a copy of the packet bytes is allocated and
- * appended to framed_packets. The caller is responsible for freeing these buffers.
- *
- * Thread-safe: reads only from the provided buffer, writes only to the output
- * list and consumed/result output parameters. Does not touch clusterNode,
- * clusterState, or any main-thread structure.
- **/
-void clusterFramePackets(char *rcvbuf,
-                         size_t rcvbuf_len,
-                         size_t *consumed,
-                         list *framed_packets,
-                         clusterIOResult *result) {
+ * Thread-safe: reads only from the provided buffer and writes only to the
+ * output parameters. Does not touch clusterNode, clusterState, or any
+ * main-thread structure. */
+void clusterSnapshotPackets(char *rcvbuf,
+                            size_t rcvbuf_len,
+                            size_t *snapshot_len,
+                            size_t *packet_count,
+                            clusterIOResult *result) {
     size_t offset = 0;
 
-    *consumed = 0;
+    *snapshot_len = 0;
+    *packet_count = 0;
     *result = CLUSTER_IO_OK;
 
     while (offset < rcvbuf_len) {
@@ -4718,31 +4668,28 @@ void clusterFramePackets(char *rcvbuf,
         /* Wait for the full message to arrive. */
         if (remaining < totlen) break;
 
-        /* Copy the packet into a standalone buffer and append to the output list. */
-        char *pkt = zmalloc(totlen);
-        memcpy(pkt, rcvbuf + offset, totlen);
-        listAddNodeTail(framed_packets, pkt);
-
         offset += totlen;
+        (*packet_count)++;
     }
 
-    *consumed = offset;
+    *snapshot_len = offset;
 }
 
 /* Cluster readable event handler: try to offload the read to an I/O thread.
  * If offload is unavailable (pool inactive, queue full), fall back to the
  * synchronous clusterReadHandler.
- * First defensively drains any leftover framed packets before reading more. */
+ * First defensively drains any leftover queued packet snapshot before reading
+ * more. */
 static void clusterReadOffloadHandler(connection *conn) {
     clusterLink *link = connGetPrivateData(conn);
 
     /* A worker read job is still in flight or its completion hasn't been
-     * consumed yet. Do not touch framed_packets or rcvbuf from the main
+     * consumed yet. Do not touch the read snapshot or rcvbuf from the main
      * thread until clusterHandleReadCompletion() transitions the link back
      * to idle. */
     if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return;
 
-    if (!clusterDrainFramedPackets(link)) return;
+    if (!clusterDrainRcvbufSnapshot(link)) return;
 
     if (trySendClusterReadToIOThreads(link) == C_ERR) {
         clusterReadHandler(conn);
@@ -6221,7 +6168,7 @@ static void freeClusterLinkOnBufferLimitReached(clusterLink *link) {
         return;
     }
 
-    unsigned long long mem_link = link->send_msg_queue_mem + link->framed_packets_mem;
+    unsigned long long mem_link = link->send_msg_queue_mem;
     if (mem_link > server.cluster_link_msg_queue_limit_bytes) {
         serverLog(LL_WARNING,
                   "Freeing cluster link(%s node %.40s (%s), used memory: %llu) due to "
@@ -8665,20 +8612,17 @@ void clusterReadJob(clusterLink *link) {
         break;
     }
 
-    /* If we read something, frame packets and update the read timestamp. */
+    /* If we read something, snapshot the complete packet prefix and update
+     * the read timestamp. */
     if (total_read > 0) {
-        size_t consumed = 0;
+        size_t snapshot_len = 0;
+        size_t packet_count = 0;
         clusterIOResult frame_result;
-        clusterFramePackets(link->rcvbuf, link->rcvbuf_len, &consumed,
-                            link->framed_packets, &frame_result);
-
-        /* Compact the receive buffer and track queued framed packet payload
-         * bytes for accounting. This is not allocator-exact memory usage. */
-        if (consumed > 0) {
-            link->framed_packets_mem = consumed;
-            memmove(link->rcvbuf, link->rcvbuf + consumed, link->rcvbuf_len - consumed);
-            link->rcvbuf_len -= consumed;
-        }
+        serverAssert(link->io_rcvbuf_snapshot_len == 0);
+        serverAssert(link->io_rcvbuf_snapshot_packets == 0);
+        clusterSnapshotPackets(link->rcvbuf, link->rcvbuf_len, &snapshot_len, &packet_count, &frame_result);
+        link->io_rcvbuf_snapshot_len = snapshot_len;
+        link->io_rcvbuf_snapshot_packets = packet_count;
 
         /* If framing found a protocol error, that takes priority. */
         if (frame_result != CLUSTER_IO_OK) {
@@ -8796,12 +8740,10 @@ void clusterHandleReadCompletion(clusterLink *link) {
         server.stat_cluster_links_memory += link->rcvbuf_alloc - link->rcvbuf_alloc_at_dispatch;
     }
 
-    /* Account for framed packet memory produced by the I/O thread.
-     * framed_packets is guaranteed empty before dispatch (leftovers are
-     * drained in clusterReadOffloadHandler), so framed_packets_mem and
-     * listLength reflect only this job's output. */
-    server.stat_cluster_links_memory += link->framed_packets_mem;
-    server.stat_cluster_queued_inbound_packets += listLength(link->framed_packets);
+    /* Account for complete packets queued in rcvbuf by the I/O thread.
+     * Any leftover snapshot is drained before dispatch, so these fields
+     * reflect only this job's output. */
+    server.stat_cluster_queued_inbound_packets += link->io_rcvbuf_snapshot_packets;
 
     /* If the link was already marked for async close, check if we can
      * perform the final free now that io_refs has been decremented. */
@@ -8832,7 +8774,7 @@ void clusterHandleReadCompletion(clusterLink *link) {
                   (result == CLUSTER_IO_EOF) ? "connection closed" : "read error");
     }
 
-    if (!clusterDrainFramedPackets(link)) return;
+    if (!clusterDrainRcvbufSnapshot(link)) return;
 
     if (link->rcvbuf_len == 0) {
         clusterShrinkRcvbuf(link);

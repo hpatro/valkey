@@ -77,10 +77,9 @@ typedef struct clusterLink {
     /* Pre-dispatch rcvbuf_alloc for memory accounting on completion */
     size_t rcvbuf_alloc_at_dispatch; /* rcvbuf_alloc when read job was dispatched */
 
-    /* Framed packet queue for read offload */
-    list *framed_packets;      /* List of framed packet buffers */
-    size_t framed_packets_mem; /* Sum of framed packet payload bytes queued in framed_packets.
-                                * Used for accounting/limits, not allocator-exact usage. */
+    /* Async read snapshot/result */
+    size_t io_rcvbuf_snapshot_len;     /* Complete packet bytes queued at the start of rcvbuf */
+    size_t io_rcvbuf_snapshot_packets; /* Number of complete packets in io_rcvbuf_snapshot_len */
 } clusterLink;
 
 /* Cluster link flags and macros. */

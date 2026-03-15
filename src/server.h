@@ -1926,7 +1926,7 @@ struct valkeyServer {
     long long stat_cluster_accepts_offloaded;           /* Cluster accepts offloaded to I/O threads */
     long long stat_cluster_io_sync_fallbacks;           /* Cluster I/O ops that fell back to sync */
     long long stat_cluster_async_closed_links;          /* Cluster links deferred-freed via async_close */
-    long long stat_cluster_queued_inbound_packets;      /* Framed packets awaiting main-thread application */
+    long long stat_cluster_queued_inbound_packets;      /* Complete cluster packets awaiting main-thread application */
     long long
         stat_unexpected_error_replies;                 /* Number of unexpected (aof-loading, replica to primary, etc.) error replies */
     long long stat_total_error_replies;                /* Total number of issued error replies ( command + rejected errors ) */

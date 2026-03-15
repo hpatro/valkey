@@ -638,10 +638,10 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     /* Invariant: io_refs must be 0 when both states are IDLE. */
     serverAssert(link->io_refs == 0);
 
-    /* Don't dispatch a new read if there are unapplied framed packets.
-     * The readable event will keep firing; the offload handler falls back
-     * to sync, which drains them first. */
-    if (listLength(link->framed_packets) > 0) return C_ERR;
+    /* clusterReadOffloadHandler() drains any queued packet snapshot before
+     * attempting a new dispatch. */
+    serverAssert(link->io_rcvbuf_snapshot_len == 0);
+    serverAssert(link->io_rcvbuf_snapshot_packets == 0);
 
     /* No I/O thread pool available — synchronous fallback. */
     if (server.active_io_threads_num <= 1) {
