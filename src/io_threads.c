@@ -744,17 +744,21 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
  * Returns C_OK if offloaded, C_ERR if fallback is needed. */
 int trySendClusterAcceptToIOThreads(connection *conn) {
     if (!(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD)) return C_ERR;
+    /* A cluster accept job is already in flight for this connection. */
+    if (conn->flags & CONN_FLAG_ACCEPT_OFFLOAD_PENDING) return C_OK;
     if (server.active_io_threads_num <= 1) {
         server.stat_cluster_io_sync_fallbacks++;
         return C_ERR;
     }
 
+    conn->flags |= CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
     connSetPostponeUpdateState(conn, 1);
     connIncrRefs(conn);
 
     if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(conn, JOB_REQ_CLUSTER_ACCEPT)) == false)) {
         connDecrRefs(conn);
         connSetPostponeUpdateState(conn, 0);
+        conn->flags &= ~CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
         server.stat_cluster_io_sync_fallbacks++;
         return C_ERR;
     }

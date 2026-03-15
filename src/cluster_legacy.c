@@ -8914,6 +8914,7 @@ void clusterHandleWriteCompletion(clusterLink *link) {
 }
 
 void clusterHandleAcceptCompletion(connection *conn) {
+    conn->flags &= ~CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
     connSetPostponeUpdateState(conn, 0);
     connUpdateState(conn);
     connDecrRefs(conn);
