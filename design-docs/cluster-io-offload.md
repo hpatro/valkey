@@ -2,196 +2,243 @@
 
 ## Overview
 
-Offloads cluster bus read, write, and TLS accept operations from the main
-thread onto the I/O-thread pool (PR #3324 queue-based model), while keeping
-all cluster state mutation on the main thread.
+Cluster bus read, write, and TLS accept work can run on the shared I/O thread
+pool, while all cluster state mutation stays on the main thread.
 
-Jobs flow through the shared SPMC work queue (`io_shared_inbox`) and
-completions return via the shared MPSC response queue (`io_shared_outbox`).
-When the pool is inactive or the queue is full, all paths fall back to
-synchronous I/O on the main thread.
+Jobs flow through:
+- `io_shared_inbox` (SPMC): main thread -> I/O workers
+- `io_shared_outbox` (MPSC): I/O workers -> main thread
+
+If the pool is inactive or enqueue fails, the caller falls back to synchronous
+I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
 
 ## Architecture
 
-```
+```text
 +---------------------------+       +-------------------------------+       +---------------------------+
 |       Main Thread         |       |        Shared Queues          |       |     I/O Thread Pool       |
 |                           |       |                               |       |                           |
-| Dispatch Logic            |       | spmcQueue io_shared_inbox     |       | clusterReadJob            |
-|  (beforeSleep/clusterCron)|------>|  (SPMC: main -> I/O threads)  |------>|  (read + frame)           |
-|                           |       |                               |       |                           |
-| Response Drainer          |       | mpscQueue io_shared_outbox    |       | clusterWriteJob           |
-|  (beforeSleep/blocked)    |<------|  (MPSC: I/O threads -> main)  |<------|  (write from inflight)    |
-|                           |       |                               |       |                           |
-| Packet Application        |       +-------------------------------+       | clusterAcceptJob          |
-|  (clusterProcessPacket)   |                                               |  (TLS handshake)          |
-|                           |                                               +---------------------------+
-| Write Completion Handler  |
-| Accept Completion Handler |
+| clusterReadOffloadHandler |------>| io_shared_inbox (SPMC)        |------>| clusterReadJob            |
+| clusterWriteHandler       |       |                               |       | clusterWriteJob           |
+| clusterAcceptHandler      |       |                               |       | clusterAcceptJob          |
+| clusterSendMessage        |       +-------------------------------+       +---------------------------+
+|                           |
+| processIOThreadsResponses |<------ io_shared_outbox (MPSC) <------ sendToMainThread(...)
+| clusterHandle*Completion  |
+| clusterProcessPacketBuffer|
 | freeClusterLink           |
-|  (deferred if io_refs > 0)|
 +---------------------------+
 ```
 
 ## Key Design Decisions
 
-1. Reuse PR #3324 shared SPMC/MPSC queues — no cluster-specific threading primitives.
-2. I/O threads frame packets (signature/length validation only); main thread applies them.
-3. Write path swaps `send_msg_queue` ↔ `send_msg_queue_inflight` in O(1); I/O thread writes from inflight only.
-4. Deferred teardown via `io_refs` counter and `async_close` flag. TLS close defers SSL teardown when `connHasRefs()`.
-5. Dispatch holds a connection ref (`connIncrRefs`) and postpones state updates (`connSetPostponeUpdateState`).
-6. Accept offload operates on bare `connection *` — `clusterLink` is created only after successful handshake.
-7. `ConnOwnerKind` discriminator guards client-specific casts in `socket.c` safety assertions.
+1. Reuse the existing shared SPMC/MPSC queues; no cluster-specific threading primitives.
+2. I/O threads do transport work only: `connRead`, `connWrite`, `connAccept`, framing, and result publication.
+3. Main thread alone applies cluster packets and mutates cluster state.
+4. Write offload uses a single canonical `send_msg_queue` plus a snapshot boundary:
+   `io_last_send_block`, `io_head_offset`, and `io_nodes_sent`.
+5. Read completion drains `framed_packets` fully; there is no bounded packet/time budget.
+6. Link teardown is deferred with `io_refs` and `async_close`.
+7. Accept offload is serialized per connection with `CONN_FLAG_ACCEPT_OFFLOAD_PENDING`.
+8. `ConnOwnerKind` lets generic connection/TLS code distinguish client-owned and cluster-owned connections safely.
 
 ## Data Flow: Read Path
 
+```text
+[MAIN dispatch] clusterReadOffloadHandler
+    |
+    | drain leftovers
+    | trySendClusterReadToIOThreads()
+    v
+[QUEUE] io_shared_inbox
+    | JOB_REQ_CLUSTER_READ
+    v
+[IO worker] clusterReadJob
+    | connRead() into rcvbuf
+    | grow rcvbuf if needed
+    | frame packets into framed_packets
+    | compact rcvbuf
+    | set io_result
+    v
+[QUEUE] io_shared_outbox
+    | JOB_RES_CLUSTER_READ
+    v
+[MAIN completion] clusterHandleReadCompletion
+    | set io_read_state = IDLE
+    | io_refs--
+    | reconcile memory
+    | drain framed_packets fully
+    | shrink/free as needed
 ```
-  Main Thread                    Work Queue       I/O Thread              Response Queue
-  |                                  |                |                        |
-  | clusterLink readable fires       |                |                        |
-  | Check io_read_state == IDLE      |                |                        |
-  | Set io_read_state = PENDING      |                |                        |
-  | io_refs++                        |                |                        |
-  |--- push clusterReadJob(link) --->|                |                        |
-  |                                  |--- dequeue --->|                        |
-  |                                  |                | connRead() into rcvbuf |
-  |                                  |                | Frame packets          |
-  |                                  |                |  (<=16 pkts or <=64KB) |
-  |                                  |                | Update last_io_read_time
-  |                                  |                |--- post completion --->|
-  |<-------------- drain completions in beforeSleep --|------------------------|
-  | io_refs--, io_read_state = IDLE  |                |                        |
-  | Apply <=64 packets or <=250us    |                |                        |
-  |                                  |                |                        |
-  | [If async_close && io_refs==0: final free]        |                        |
-```
+
+If dispatch returns `C_ERR`, the main thread falls back to `clusterReadHandler(conn)`.
 
 ## Data Flow: Write Path
 
+```text
+[MAIN dispatch] clusterSendMessage / clusterWriteHandler
+    |
+    | append to send_msg_queue
+    | snapshot io_last_send_block / io_head_offset
+    | trySendClusterWriteToIOThreads()
+    v
+[QUEUE] io_shared_inbox
+    | JOB_REQ_CLUSTER_WRITE
+    v
+[IO worker] clusterWriteJob
+    | write from queue head
+    | stop at io_last_send_block
+    | set io_nodes_sent
+    | set io_head_offset
+    | set io_result
+    v
+[QUEUE] io_shared_outbox
+    | JOB_RES_CLUSTER_WRITE
+    v
+[MAIN completion] clusterHandleWriteCompletion
+    | set io_write_state = IDLE
+    | io_refs--
+    | pop sent nodes
+    | apply head_msg_send_offset
+    | reinstall handler or free on error
 ```
-  Main Thread                    Work Queue       I/O Thread              Response Queue
-  |                                  |                |                        |
-  | clusterSendMessage appends       |                |                        |
-  |  to send_msg_queue (pending)     |                |                        |
-  | Check io_write_state == IDLE     |                |                        |
-  |  && io_read_state == IDLE        |                |                        |
-  |  && pending non-empty            |                |                        |
-  | Swap pending <-> inflight (O(1)) |                |                        |
-  | Set io_write_state = PENDING     |                |                        |
-  | io_refs++                        |                |                        |
-  |--- push clusterWriteJob(link) -->|                |                        |
-  |                                  |--- dequeue --->|                        |
-  |                                  |                | connWrite() from       |
-  |                                  |                |  inflight at offset    |
-  |                                  |                |--- post completion --->|
-  |<-------------- drain completions ------------------|------------------------|
-  | io_refs--, advance inflight      |                |                        |
-  | Pop fully-sent nodes             |                |                        |
-  | Update offset for partial        |                |                        |
-  |                                  |                |                        |
-  | [If more data: reschedule write job]              |                        |
-```
+
+Important note:
+- New messages appended while a write job is in flight stay on `send_msg_queue`,
+  but the worker stops at `io_last_send_block`, so those new nodes are picked up
+  by a later dispatch.
+
+If dispatch returns `C_ERR`, `clusterWriteHandler(conn)` falls back to the synchronous `connWrite()` loop.
 
 ## Data Flow: Accept Path (TLS)
 
+```text
+[MAIN dispatch] clusterAcceptHandler
+    |
+    | create accepted conn
+    | set owner kind
+    | allow accept offload
+    | trySendClusterAcceptToIOThreads()
+    v
+[QUEUE] io_shared_inbox
+    | JOB_REQ_CLUSTER_ACCEPT
+    v
+[IO worker] clusterAcceptJob
+    | connAccept(conn, NULL)
+    v
+[QUEUE] io_shared_outbox
+    | JOB_RES_CLUSTER_ACCEPT
+    v
+[MAIN completion] clusterHandleAcceptCompletion
+    | clear ACCEPT_OFFLOAD_PENDING
+    | finalize conn state / refs
+    | if ACCEPTING: return
+    | else clusterConnAcceptHandler()
+    | create clusterLink on success
 ```
-  Main Thread                    Work Queue       I/O Thread              Response Queue
-  |                                  |                |                        |
-  | clusterAcceptHandler:            |                |                        |
-  |  connCreateAccepted(conn)        |                |                        |
-  | Check CONN_FLAG_ALLOW_ACCEPT_    |                |                        |
-  |  OFFLOAD                         |                |                        |
-  |--- trySendClusterAcceptTo ------>|                |                        |
-  |    IOThreads(conn)               |                |                        |
-  |                                  |--- dequeue --->|                        |
-  |                                  |                | connAccept(conn)       |
-  |                                  |                |  (TLS handshake)       |
-  |                                  |                |--- post completion --->|
-  |<-- drain in processIOThreadsResponses ------------|------------------------|
-  |                                  |                |                        |
-  | [Accept succeeded]:              |                |                        |
-  |  Create clusterLink              |                |                        |
-  |  Set conn->private_data          |                |                        |
-  |  Install clusterReadHandler      |                |                        |
-  |                                  |                |                        |
-  | [Accept failed]:                 |                |                        |
-  |  connClose(conn)                 |                |                        |
-```
+
+Important note:
+- TLS retries can re-enter the generic accept offload path. Cluster-owned
+  connections are routed back to `trySendClusterAcceptToIOThreads`, and the
+  pending flag ensures only one accept job is in flight for that connection.
+
+If dispatch returns `C_ERR`, the main thread falls back to `connAccept(conn, clusterConnAcceptHandler)`.
 
 ## clusterLink I/O State
 
-```
-  IDLE --[dispatch]--> READ_PENDING or WRITE_PENDING --[completion]--> IDLE
-                                    |
-                          [freeClusterLink with io_refs > 0]
-                                    |
-                              ASYNC_CLOSE --[last completion, io_refs==0]--> FREED
+```text
+IDLE --dispatch read-->  READ_PENDING  --read completion-->  IDLE
+IDLE --dispatch write--> WRITE_PENDING --write completion--> IDLE
+
+If freeClusterLink() sees io_refs > 0:
+  detach link from node
+  remove handlers
+  set async_close = 1
+  defer final free until the last completion drops io_refs to 0
 ```
 
-Read and write PENDING are mutually exclusive — at most one I/O job per link.
+Read and write jobs are mutually exclusive per link.
 
 ## Invariants
 
 ### Link State
-- `io_refs >= 0` always; `io_refs == 0` implies both states IDLE.
-- Read PENDING and write PENDING are mutually exclusive.
-- `send_msg_queue_mem` = combined memory of `send_msg_queue` + `send_msg_queue_inflight`.
-- `stat_cluster_links_memory` updated on main thread only.
-- `framed_packets_mem` bounded to one read job's output (≤16 packets or ≤64 KB).
+
+- `io_refs >= 0` always.
+- `io_refs == 0` implies both `io_read_state` and `io_write_state` are IDLE.
+- Read and write jobs are mutually exclusive.
+- `send_msg_queue_mem` tracks the canonical `send_msg_queue`.
+- `stat_cluster_links_memory` is updated on the main thread.
 
 ### I/O Thread MAY
-- `connRead()`/`connWrite()`/`connAccept()` on the offloaded connection
-- Grow `link->rcvbuf`/`rcvbuf_len`/`rcvbuf_alloc`
-- Append to `link->framed_packets`, update `framed_packets_mem`
-- Read `send_msg_queue_inflight`; write `inflight_nodes_sent`, `inflight_send_offset`
-- Write `io_result`, `last_io_read_time` (atomic)
-- Call `sendToMainThread()`, `mstime()`
+
+- Call `connRead()` / `connWrite()` / `connAccept()` on the offloaded connection.
+- Grow `rcvbuf` and update `rcvbuf_len` / `rcvbuf_alloc`.
+- Append framed packet buffers to `framed_packets`.
+- Read `send_msg_queue` up to the snapped `io_last_send_block`.
+- Write `io_result`, `io_nodes_sent`, `io_head_offset`, and `last_io_read_time`.
+- Publish completions with `sendToMainThread()`.
 
 ### I/O Thread MUST NOT
-- Touch `clusterNode`, `clusterState`, slot/epoch/failover state, `todo_before_sleep`
-- Call `clusterProcessPacket()` or any state-mutating function
-- Modify `io_read_state`, `io_write_state`, `io_refs`, `async_close`
-- Append to or pop from `send_msg_queue` (pending queue)
-- Modify `send_msg_queue_mem` or `stat_cluster_links_memory`
-- Free `clusterLink`, `clusterNode`, or connection objects
 
-### Main Thread MUST NOT (while job in flight)
-- Touch `rcvbuf`/`rcvbuf_len`/`rcvbuf_alloc`, `framed_packets`/`framed_packets_mem`
-- Touch `send_msg_queue_inflight`/`inflight_send_offset`
-- Dispatch a second job for the same link
+- Touch `clusterNode`, `clusterState`, slot ownership, epoch/failover state, or any other cluster-global state.
+- Call `clusterProcessPacket()` or any packet-application logic.
+- Modify `io_read_state`, `io_write_state`, `io_refs`, or `async_close`.
+- Pop queue nodes or update `send_msg_queue_mem`.
+- Update `server.stat_cluster_links_memory`.
+- Free `clusterLink`, `clusterNode`, or connection objects.
+
+### Main Thread MUST NOT While a Job Is In Flight
+
+- For read: touch `rcvbuf`, `rcvbuf_len`, `rcvbuf_alloc`, `framed_packets`, or `framed_packets_mem`.
+- For write: pop already-visible queue nodes or rewrite the tracked head send offset.
+- Dispatch a second read/write job for the same link.
 
 ## Dispatch Contract
 
-All three dispatch functions (`trySendCluster{Read,Write,Accept}ToIOThreads`):
-1. `connSetPostponeUpdateState(conn, 1)` + `connIncrRefs(conn)` before enqueue
-2. On failure: rollback refs and state postponement
-3. On completion: `connSetPostponeUpdateState(conn, 0)` + `connUpdateState(conn)` + `connDecrRefs(conn)`
+All three dispatch helpers (`trySendClusterReadToIOThreads`,
+`trySendClusterWriteToIOThreads`, `trySendClusterAcceptToIOThreads`) follow the
+same pattern:
 
-Return `C_OK` if offloaded or if a job is already pending (prevents sync fallback on busy link).
-Return `C_ERR` if pool inactive or queue full (caller falls back to sync).
+1. `connSetPostponeUpdateState(conn, 1)` and `connIncrRefs(conn)` before enqueue.
+2. Roll back state and refs on enqueue failure.
+3. Finalize postponed connection state on completion.
+
+Return values:
+- `C_OK`: work was offloaded, or an equivalent job is already pending.
+- `C_ERR`: pool inactive or enqueue failed, so caller may sync-fallback.
 
 ## Deferred Teardown
 
-`freeClusterLink` with `io_refs > 0`:
-1. Set `async_close = 1`, detach from node, close connection (causes in-flight I/O to fail)
-2. Return 0 (deferred)
-3. Completion handler decrements `io_refs`; if 0 and `async_close`: final free
+If `freeClusterLink(link)` sees `io_refs > 0`:
 
-TLS: `connTLSClose` defers `SSL_shutdown`/`SSL_free` when `connHasRefs()` is true.
+1. Detach the link from node fields.
+2. Remove read/write handlers so no new work is scheduled.
+3. Set `async_close = 1`.
+4. Return without closing/freeing immediately.
+
+The actual `connClose()` and final free happen later, when the last completion
+handler drops `io_refs` to `0`.
 
 ## Failure Detection
 
-`data_delay = now - max(node->data_received, link->last_io_read_time, inbound_link->last_io_read_time)`
+`last_io_read_time` is updated by the read worker on successful reads and is
+included in the cluster node delay calculation.
 
-All timestamps use `mstime()`. I/O thread writes `last_io_read_time` with `memory_order_release`;
-main thread reads with `memory_order_acquire`.
+```text
+data_delay = now - max(node->data_received,
+                       node->link->last_io_read_time,
+                       node->inbound_link->last_io_read_time)
+```
+
+The I/O thread stores `last_io_read_time` with release ordering; the main thread
+loads it with acquire ordering.
 
 ## Error Handling
 
-| Error | Handling |
-|-------|----------|
-| `CLUSTER_IO_BAD_HEADER/BAD_LENGTH` | Log warning, `freeClusterLink` |
-| `CLUSTER_IO_READ_ERROR/EOF` | Log debug, `freeClusterLink` |
-| `CLUSTER_IO_WRITE_ERROR` | Log debug, `freeClusterLink` |
-| `CLUSTER_IO_ACCEPT_ERROR` | Log verbose, `connClose(conn)` |
-| Queue full / pool inactive | Sync fallback, increment `stat_cluster_io_sync_fallbacks` |
+| Result / Condition | Handling |
+|--------------------|----------|
+| `CLUSTER_IO_BAD_HEADER` / `CLUSTER_IO_BAD_LENGTH` | Log warning, free link immediately |
+| `CLUSTER_IO_READ_ERROR` / `CLUSTER_IO_EOF` | Log debug, drain framed packets, then free link |
+| `CLUSTER_IO_WRITE_ERROR` | Log debug, free link |
+| `CONN_STATE_ACCEPTING` after accept completion | Leave connection open; TLS event flow will retry |
+| Pool inactive / queue full | Sync fallback + increment `stat_cluster_io_sync_fallbacks` |
