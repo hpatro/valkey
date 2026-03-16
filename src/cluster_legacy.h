@@ -2,6 +2,14 @@
 #define CLUSTER_LEGACY_H
 
 #include <stdint.h>
+#ifndef __cplusplus
+#include <stdatomic.h>
+typedef _Atomic(void *) atomic_void_ptr;
+#else
+typedef size_t atomic_size_t;
+typedef void *atomic_void_ptr;
+#endif
+
 #define CLUSTER_PORT_INCR 10000 /* Cluster port = baseport + PORT_INCR */
 
 /* The following defines are amount of time, sometimes expressed as
