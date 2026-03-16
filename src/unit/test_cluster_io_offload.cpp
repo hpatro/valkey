@@ -33,7 +33,9 @@ typedef struct FakeConn {
     int update_calls;
 } FakeConn;
 
-static int fakeConnGetType(void) { return CONN_TYPE_SOCKET; }
+static int fakeConnGetType(void) {
+    return CONN_TYPE_SOCKET;
+}
 
 static int fakeWrite(connection *conn, const void *data, size_t len) {
     FakeConn *fc = (FakeConn *)conn;
