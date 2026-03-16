@@ -4,9 +4,12 @@
 #include <stdint.h>
 #ifndef __cplusplus
 #include <stdatomic.h>
+typedef _Atomic(size_t) atomic_size_t;
+typedef _Atomic(mstime_t) atomic_mstime_t;
 typedef _Atomic(void *) atomic_void_ptr;
 #else
 typedef size_t atomic_size_t;
+typedef mstime_t atomic_mstime_t;
 typedef void *atomic_void_ptr;
 #endif
 
@@ -60,7 +63,7 @@ typedef struct clusterLink {
     size_t head_msg_send_offset;           /* Number of bytes already sent of message at head of queue */
     unsigned long long send_msg_queue_mem; /* Memory in bytes used by message queue */
     char *rcvbuf;                          /* Packet reception buffer */
-    _Atomic size_t rcvbuf_len;             /* Used size of rcvbuf */
+    atomic_size_t rcvbuf_len;             /* Used size of rcvbuf */
     size_t rcvbuf_alloc;                   /* Allocated size of rcvbuf */
     clusterNode *node;                     /* Node related to this link. Initialized to NULL when unknown */
     int inbound;                           /* 1 if this link is an inbound link accepted from the related node */
@@ -80,7 +83,7 @@ typedef struct clusterLink {
     int io_nodes_sent;            /* Number of fully-sent head nodes (set by I/O thread) */
 
     /* Timestamp for failure detection (cross-thread) */
-    _Atomic mstime_t last_io_read_time; /* Updated by I/O thread on successful read */
+    atomic_mstime_t last_io_read_time; /* Updated by I/O thread on successful read */
 
     /* Pre-dispatch rcvbuf_alloc for memory accounting on completion */
     size_t rcvbuf_alloc_at_dispatch; /* rcvbuf_alloc when read job was dispatched */
