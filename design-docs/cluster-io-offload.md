@@ -247,13 +247,7 @@ loads it with acquire ordering.
 
 ## Follow-Up
 
-- Read completion currently drains the queued `rcvbuf` snapshot in one pass on the
-  main thread and compacts the buffer after each packet.
-- Follow-up work: either reintroduce bounded completion with a correct continuation
-  mechanism, or keep full drain semantics but switch to a front-offset model so we
-  avoid repeated per-packet `memmove()` while a large burst is being applied.
-- Current behavior on `CLUSTER_IO_BAD_HEADER` / `CLUSTER_IO_BAD_LENGTH` is to close
-  the link immediately, even if the same offloaded read also contained a valid
-  packet prefix in the queued snapshot. This is accepted for now as an invalid-peer
-  path, but if we ever need sync/offload parity here, read completion should drain
-  the valid prefix before tearing the link down.
+- Read completion currently drains the queued `rcvbuf` snapshot in one pass on the main thread and compacts the buffer after each packet.
+- Follow-up work: either reintroduce bounded completion with a correct continuation mechanism, or keep full drain semantics but switch to a front-offset model so we avoid repeated per-packet `memmove()` while a large burst is being applied.
+- Current behavior on `CLUSTER_IO_BAD_HEADER` / `CLUSTER_IO_BAD_LENGTH` is to close the link immediately, even if the same offloaded read also contained a valid packet prefix in the queued snapshot. This is accepted for now as an invalid-peer path, but if we ever need sync/offload parity here, read completion should drain the valid prefix before tearing the link down.
+- Create separate queue for cluster io jobs to avoid contention with client io  jobs. This will allow us to prioritize different type of jobs and drain at different rate.
