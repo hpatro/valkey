@@ -18,14 +18,16 @@ I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
 +---------------------------+       +-------------------------------+       +---------------------------+
 |       Main Thread         |       |        Shared Queues          |       |     I/O Thread Pool       |
 |                           |       |                               |       |                           |
-| clusterReadOffloadHandler |------>| io_shared_inbox (SPMC)        |------>| clusterReadJob            |
+| clusterReadHandler        |------>| io_shared_inbox (SPMC)        |------>| clusterReadJob            |
 | clusterWriteHandler       |       |                               |       | clusterWriteJob           |
 | clusterAcceptHandler      |       |                               |       | clusterAcceptJob          |
-| clusterSendMessage        |       +-------------------------------+       +---------------------------+
-|                           |
-| processIOThreadsResponses |<------ io_shared_outbox (MPSC) <------ sendToMainThread(...)
-| clusterHandle*Completion  |
-| clusterProcessPacket      |
+| clusterSendMessage        |       |                               |       +---------------------------+
+|                           |       |                               |
+| processIOThreadsResponses |<------| io_shared_outbox (MPSC)       |<------ sendToMainThread(...)
+| clusterHandle*Completion  |       |                               |
+| buffer trimming           |       |                               |
+| link cleanup              |       |                               |
+| clusterProcessPacket      |       +-------------------------------+ 
 | freeClusterLink           |
 +---------------------------+
 ```
