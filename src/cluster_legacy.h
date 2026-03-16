@@ -521,6 +521,8 @@ void clusterHandleWriteCompletion(clusterLink *link);
 void clusterHandleAcceptCompletion(connection *conn);
 void clusterReadJob(clusterLink *link);
 void clusterWriteJob(clusterLink *link);
+
+void testOnlyFreeClusterLinkOnBufferLimitReached(clusterLink *link);
 void clusterAcceptJob(connection *conn);
 
 #endif // CLUSTER_LEGACY_H

@@ -526,6 +526,34 @@ void initIOThreads(int prev_threads_num) {
     }
 }
 
+void testOnlyInitIOThreadQueues(void) {
+    if (io_shared_inbox.buffer) spmcFree(&io_shared_inbox);
+    if (io_shared_outbox.buffer) mpscFree(&io_shared_outbox);
+    if (pending_io_responses) {
+        listRelease(pending_io_responses);
+        pending_io_responses = NULL;
+    }
+    spmcInit(&io_shared_inbox);
+    mpscInit(&io_shared_outbox);
+    io_jobs_submitted = 0;
+    atomic_store_explicit(&io_jobs_finished, 0, memory_order_relaxed);
+    cluster_io_pending_responses = 0;
+    io_thread_ticket = (mpscTicket){0};
+}
+
+void testOnlyFreeIOThreadQueues(void) {
+    if (pending_io_responses) {
+        listRelease(pending_io_responses);
+        pending_io_responses = NULL;
+    }
+    spmcFree(&io_shared_inbox);
+    mpscFree(&io_shared_outbox);
+    io_jobs_submitted = 0;
+    atomic_store_explicit(&io_jobs_finished, 0, memory_order_relaxed);
+    cluster_io_pending_responses = 0;
+    io_thread_ticket = (mpscTicket){0};
+}
+
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     /* If IO thread is already reading, return C_OK to make sure the main thread will not handle it. */

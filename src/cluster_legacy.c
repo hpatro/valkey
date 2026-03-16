@@ -6183,6 +6183,11 @@ static void freeClusterLinkOnBufferLimitReached(clusterLink *link) {
     }
 }
 
+/* ========================== Wrapper Functions for Testing ========================== */
+void testOnlyFreeClusterLinkOnBufferLimitReached(clusterLink *link) {
+    freeClusterLinkOnBufferLimitReached(link);
+}
+
 /* Free a link to a node if its buffer size exceeded limit. */
 static void clusterNodeCronFreeLinkOnBufferLimitReached(clusterNode *node) {
     freeClusterLinkOnBufferLimitReached(node->link);
