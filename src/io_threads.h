@@ -26,7 +26,7 @@ typedef enum {
     JOB_REQ_CLUSTER_ACCEPT,
     JOB_REQ_COUNT
 } JobRequestSPMC;
-_Static_assert(JOB_REQ_COUNT <= 8, "JOB_REQ_COUNT must not exceed 8 for pointer arithmetic");
+static_assert(JOB_REQ_COUNT <= 8, "JOB_REQ_COUNT must not exceed 8 for pointer arithmetic");
 
 /* Tags for the MPSC response queue (I/O threads → main thread). */
 typedef enum {
@@ -37,7 +37,7 @@ typedef enum {
     JOB_RES_CLUSTER_ACCEPT,
     JOB_RES_COUNT
 } JobResult;
-_Static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
+static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
 
 typedef void (*job_handler)(void *);
 
