@@ -667,7 +667,7 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
     /* Invariant: io_refs must be 0 when both states are IDLE. */
     serverAssert(link->io_refs == 0);
 
-    /* clusterReadOffloadHandler() drains any queued packet snapshot before
+    /* clusterReadHandler() drains any queued packet snapshot before
      * attempting a new dispatch. */
     serverAssert(link->io_rcvbuf_snapshot_len == 0);
     serverAssert(link->io_rcvbuf_snapshot_packets == 0);

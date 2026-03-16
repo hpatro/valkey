@@ -66,7 +66,6 @@ clusterNode *createClusterNode(char *nodename, int flags);
 void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterReadHandler(connection *conn);
-static void clusterReadOffloadHandler(connection *conn);
 void clusterSendPing(clusterLink *link, int type);
 void clusterSendFail(char *nodename);
 void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request);
@@ -1890,7 +1889,7 @@ static void clusterConnAcceptHandler(connection *conn) {
     connSetOwnerKind(conn, CONN_OWNER_CLUSTER_LINK);
 
     /* Register read handler */
-    connSetReadHandler(conn, clusterReadOffloadHandler);
+    connSetReadHandler(conn, clusterReadHandler);
 }
 
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -4583,7 +4582,7 @@ void clusterLinkConnectHandler(connection *conn) {
     }
 
     /* Register a read handler from now on */
-    connSetReadHandler(conn, clusterReadOffloadHandler);
+    connSetReadHandler(conn, clusterReadHandler);
 
     /* Queue a PING in the new connection ASAP: this is crucial
      * to avoid false positives in failure detection.
@@ -4678,27 +4677,6 @@ void clusterSnapshotPackets(char *rcvbuf,
     *snapshot_len = offset;
 }
 
-/* Cluster readable event handler: try to offload the read to an I/O thread.
- * If offload is unavailable (pool inactive, queue full), fall back to the
- * synchronous clusterReadHandler.
- * First defensively drains any leftover queued packet snapshot before reading
- * more. */
-static void clusterReadOffloadHandler(connection *conn) {
-    clusterLink *link = connGetPrivateData(conn);
-
-    /* A worker read job is still in flight or its completion hasn't been
-     * consumed yet. Do not touch the read snapshot or rcvbuf from the main
-     * thread until clusterHandleReadCompletion() transitions the link back
-     * to idle. */
-    if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return;
-
-    if (!clusterDrainRcvbufSnapshot(link)) return;
-
-    if (trySendClusterReadToIOThreads(link) == C_ERR) {
-        clusterReadHandler(conn);
-    }
-}
-
 /* Read data. Try to read the first field of the header first to check the
  * full length of the packet. When a whole packet is in memory this function
  * will call the function to process the packet. And so forth. */
@@ -4708,6 +4686,18 @@ void clusterReadHandler(connection *conn) {
     clusterMsgHeader *hdr;
     clusterLink *link = connGetPrivateData(conn);
     unsigned int readlen, rcvbuflen;
+
+    /* A worker read job is still in flight or its completion hasn't been
+     * consumed yet. Do not touch the read snapshot or rcvbuf from the main
+     * thread until clusterHandleReadCompletion() transitions the link back
+     * to idle. */
+    if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return;
+
+    if (!clusterDrainRcvbufSnapshot(link)) return;
+
+    /* Try to offload the read first. If offload is unavailable (pool inactive,
+     * queue full), fall back to the synchronous path below. */
+    if (trySendClusterReadToIOThreads(link) == C_OK) return;
 
     while (1) { /* Read as long as there is data to read. */
         rcvbuflen = link->rcvbuf_len;
