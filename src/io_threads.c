@@ -32,11 +32,12 @@ _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
 /* Job Types for Tagged Pointers
  * We use the lower 3 bits of the pointer to store the job type.
- * Requires data pointers to be 8-byte aligned (jemalloc with --with-lg-quantum=3). */
+ * Callers must only pass pointers whose low 3 bits are zero. */
 #define JOB_TAG_MASK 0x7
 #define JOB_PTR_MASK (~(uintptr_t)JOB_TAG_MASK)
 
 static inline void *tagJob(void *ptr, int type) {
+    serverAssert(((uintptr_t)ptr & JOB_TAG_MASK) == 0);
     return (void *)((uintptr_t)ptr | type);
 }
 
@@ -886,7 +887,12 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
 
-    void *job = tagJob(objectGetVal(obj), JOB_REQ_FREE_OBJ);
+    void *ptr = objectGetVal(obj);
+    /* JOB_REQ_FREE_OBJ uses tagged pointers, so the SDS data pointer must be
+     * naturally aligned. Otherwise its existing low bits would corrupt the tag. */
+    if (((uintptr_t)ptr & JOB_TAG_MASK) != 0) return C_ERR;
+
+    void *job = tagJob(ptr, JOB_REQ_FREE_OBJ);
     if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) return C_ERR;
     objectSetVal(obj, NULL);
     decrRefCount(obj);
