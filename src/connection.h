@@ -68,9 +68,9 @@ typedef enum {
     CONN_OWNER_CLUSTER_LINK, /* private_data points to a clusterLink */
 } ConnOwnerKind;
 
-#define CONN_FLAG_CLOSE_SCHEDULED (1 << 0)      /* Closed scheduled by a handler */
-#define CONN_FLAG_WRITE_BARRIER (1 << 1)        /* Write barrier requested */
-#define CONN_FLAG_ALLOW_ACCEPT_OFFLOAD (1 << 2) /* Connection accept can be offloaded to IO threads. */
+#define CONN_FLAG_CLOSE_SCHEDULED (1 << 0)        /* Closed scheduled by a handler */
+#define CONN_FLAG_WRITE_BARRIER (1 << 1)          /* Write barrier requested */
+#define CONN_FLAG_ALLOW_ACCEPT_OFFLOAD (1 << 2)   /* Connection accept can be offloaded to IO threads. */
 #define CONN_FLAG_ACCEPT_OFFLOAD_PENDING (1 << 3) /* Accept offload job is currently in flight. */
 
 typedef enum {
