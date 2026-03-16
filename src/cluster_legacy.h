@@ -63,7 +63,7 @@ typedef struct clusterLink {
     size_t head_msg_send_offset;           /* Number of bytes already sent of message at head of queue */
     unsigned long long send_msg_queue_mem; /* Memory in bytes used by message queue */
     char *rcvbuf;                          /* Packet reception buffer */
-    atomic_size_t rcvbuf_len;             /* Used size of rcvbuf */
+    atomic_size_t rcvbuf_len;              /* Used size of rcvbuf */
     size_t rcvbuf_alloc;                   /* Allocated size of rcvbuf */
     clusterNode *node;                     /* Node related to this link. Initialized to NULL when unknown */
     int inbound;                           /* 1 if this link is an inbound link accepted from the related node */
