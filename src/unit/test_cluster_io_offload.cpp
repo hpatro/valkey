@@ -319,10 +319,13 @@ TEST_F(ClusterIOOffloadTest, FreeClusterLinkDefersWhenIoRefOutstanding) {
     link->io_read_state = CLUSTER_LINK_IO_PENDING;
 
     int freed_now = freeClusterLink(link);
-    releaseLinkOwnership(link);
 
     EXPECT_EQ(freed_now, 0);
     EXPECT_EQ(link->async_close, 1);
+
+    /* Restore the synthetic in-flight state so fixture teardown can free it. */
+    link->io_refs = 0;
+    link->io_read_state = CLUSTER_LINK_IO_IDLE;
 }
 
 TEST_F(ClusterIOOffloadTest, ReadCompletionFinalizesDeferredFree) {
@@ -344,11 +347,20 @@ TEST_F(ClusterIOOffloadTest, WriteDispatchSnapshotsBoundary) {
     enqueueFakeMsg(link);
     enqueueFakeMsg(link);
 
-    int rc = trySendClusterWriteToIOThreads(link);
+    int res = trySendClusterWriteToIOThreads(link);
 
-    EXPECT_EQ(rc, C_OK);
+    EXPECT_EQ(res, C_OK);
     EXPECT_NE(link->io_last_send_block, (listNode *)NULL);
     EXPECT_EQ(link->io_head_offset, 0u);
+
+    /* Undo the synthetic dispatch state so fixture teardown can free the link. */
+    connSetPostponeUpdateState(link->conn, 0);
+    link->conn->refs--;
+    link->io_write_state = CLUSTER_LINK_IO_IDLE;
+    link->io_refs = 0;
+    link->io_last_send_block = NULL;
+    link->io_head_offset = 0;
+    link->io_nodes_sent = 0;
 }
 
 TEST_F(ClusterIOOffloadTest, WriteCompletionPopsOnlyVisibleNodes) {

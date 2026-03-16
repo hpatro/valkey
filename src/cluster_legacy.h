@@ -6,11 +6,9 @@
 #include <stdatomic.h>
 typedef _Atomic(size_t) atomic_size_t;
 typedef _Atomic(mstime_t) atomic_mstime_t;
-typedef _Atomic(void *) atomic_void_ptr;
 #else
 typedef size_t atomic_size_t __attribute__((aligned(sizeof(size_t))));
 typedef mstime_t atomic_mstime_t __attribute__((aligned(sizeof(mstime_t))));
-typedef void *atomic_void_ptr __attribute__((aligned(sizeof(void *))));
 #endif
 
 #define CLUSTER_PORT_INCR 10000 /* Cluster port = baseport + PORT_INCR */
