@@ -4857,9 +4857,10 @@ static void clusterNodeStartFailureReportClear(clusterNode *node) {
     node->fail_report_clear_time = mstime() + clusterFailureReportClearValidity();
 }
 
-static inline bool nodeSupportsLightMsgHdrForPing(clusterNode *n) {
-    return n->link && n->pong_received >= n->link->ctime &&
-           (n->flags & CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED);
+static inline bool linkSupportsLightMsgHdrForPing(clusterLink *link) {
+    return link && !link->inbound && link->node &&
+           link->node->pong_received >= link->ctime &&
+           (link->node->flags & CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED);
 }
 
 static int clusterShouldSendFullHeartbeat(clusterLink *link, int type, int force_full) {
@@ -4867,7 +4868,7 @@ static int clusterShouldSendFullHeartbeat(clusterLink *link, int type, int force
     if (!link->node) return 1;
     if (type != CLUSTERMSG_TYPE_PING && type != CLUSTERMSG_TYPE_PONG) return 1;
     if (link->node == myself || nodeInHandshake(link->node) || nodeInMeetState(link->node)) return 1;
-    if (!nodeSupportsLightMsgHdrForPing(link->node)) return 1;
+    if (!linkSupportsLightMsgHdrForPing(link)) return 1;
     if (mstime() - link->node->last_full_heartbeat_sent >= clusterFullHeartbeatInterval()) {
         return 1;
     }
