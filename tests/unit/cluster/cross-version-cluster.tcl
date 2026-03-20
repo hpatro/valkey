@@ -38,10 +38,10 @@ tags {external:skip needs:other-server cluster singledb} {
 
 tags {external:skip needs:other-server cluster singledb compatible-redis} {
     test "Cross version cluster - PING/PONG" {
-        start_server {config "minimal-cluster-legacy.conf" start-other-server 1} {
+        start_server {config "minimal-cluster-legacy.conf" start-other-server 1 overrides {loglevel debug cluster-ping-interval 100}} {
             set other_node_name [r CLUSTER MYID]
 
-            start_server {config "minimal-cluster.conf"} {
+            start_server {config "minimal-cluster.conf" overrides {loglevel debug cluster-ping-interval 100}} {
                 r CLUSTER MEET [srv -1 host] [srv -1 port]
 
                 # Link establishment requires few PING-PONG between two nodes
@@ -53,6 +53,10 @@ tags {external:skip needs:other-server cluster singledb compatible-redis} {
                     puts [r -1 CLUSTER NODES]
                     fail "Cluster meet stuck in handshake state"
                 }
+
+                after 500
+                assert_equal 0 [count_log_message 0 "*Processing light packet of type: PING*"]
+                assert_equal 0 [count_log_message 0 "*Processing light packet of type: PONG*"]
             }
         }
     }

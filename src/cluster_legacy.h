@@ -60,8 +60,9 @@ typedef struct clusterLink {
 #define CLUSTER_NODE_MIGRATE_TO (1 << 8)                                          /* Primary eligible for replica migration. */
 #define CLUSTER_NODE_NOFAILOVER (1 << 9)                                          /* Replica will not try to failover. */
 #define CLUSTER_NODE_EXTENSIONS_SUPPORTED (1 << 10)                               /* This node supports extensions. */
-#define CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED (1 << 11)                        /* This node supports light message header for publish type. */
-#define CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED (1 << 12)                         /* This node supports light message header for module type. */
+#define CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED (1 << 11)                           /* This node supports light message header for ping/pong type. */
+#define CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED (1 << 12)                        /* This node supports light message header for publish type. */
+#define CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED (1 << 13)                         /* This node supports light message header for module type. */
 #define CLUSTER_NODE_MULTI_MEET_SUPPORTED CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED /* This node handles multi meet packet.                             \
                                                                                      Light hdr for module and multi meet were both introduced in 8.1, \
                                                                                      so we could reduce the same flag value. */
@@ -388,10 +389,12 @@ struct _clusterNode {
     mstime_t data_received;                 /* Unix time we received any data */
     mstime_t meet_sent;                     /* Unix time we sent latest meet packet */
     mstime_t fail_time;                     /* Unix time when FAIL flag was set */
+    mstime_t fail_report_clear_time;        /* Retransmit healthy gossip until this time. */
     mstime_t orphaned_time;                 /* Starting time of orphaned primary condition */
     mstime_t outbound_link_attempt_time;    /* Unix time we last tried to establish an outgoing link */
     mstime_t inbound_link_freed_time;       /* Last time we freed the inbound link for this node.
                                                If it was never freed, it is the same as ctime */
+    mstime_t last_full_heartbeat_sent;      /* Last time we sent a full ping/pong heartbeat to this node. */
     long long repl_offset;                  /* Last known repl offset for this node. */
     char ip[NET_IP_STR_LEN];                /* Latest known IP address of this node */
     sds announce_client_ipv4;               /* IPv4 for clients only. */

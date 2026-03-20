@@ -65,6 +65,7 @@ void clusterAddNode(clusterNode *node);
 void clusterAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void clusterReadHandler(connection *conn);
 void clusterSendPing(clusterLink *link, int type);
+void clusterSendPingWithOptions(clusterLink *link, int type, int force_full);
 void clusterSendFail(char *nodename);
 void clusterSendFailoverAuthIfNeeded(clusterNode *node, clusterMsg *request);
 void clusterUpdateState(void);
@@ -132,6 +133,8 @@ int auxAnnounceClientTlsPortPresent(clusterNode *n);
 int auxAnnounceClientTlsPortPresent(clusterNode *n);
 static void clusterBuildMessageHdrLight(clusterMsgLight *hdr, int type, size_t msglen);
 static void clusterBuildMessageHdr(clusterMsg *hdr, int type, size_t msglen);
+static void clusterProcessGossipEntries(clusterMsgDataGossip *g, uint16_t count, clusterNode *sender);
+static void clusterNodeStartFailureReportClear(clusterNode *node);
 void freeClusterLink(clusterLink *link);
 int verifyClusterNodeId(const char *name, int length);
 sds clusterEncodeOpenSlotsAuxField(int rdbflags);
@@ -149,6 +152,22 @@ static inline clusterMsgLight *toClusterMsgLight(void *buf) {
     clusterMsgHeader *hdr = (clusterMsgHeader *)buf;
     serverAssert(IS_LIGHT_MESSAGE(ntohs(hdr->type)));
     return (clusterMsgLight *)buf;
+}
+
+static inline uint16_t clusterMsgLightCount(const clusterMsgLight *hdr) {
+    return ntohs(hdr->notused2);
+}
+
+static inline void clusterMsgLightSetCount(clusterMsgLight *hdr, uint16_t count) {
+    hdr->notused2 = htons(count);
+}
+
+static inline mstime_t clusterFullHeartbeatInterval(void) {
+    return server.cluster_ping_interval ? server.cluster_ping_interval : server.cluster_node_timeout / 2;
+}
+
+static inline mstime_t clusterFailureReportClearValidity(void) {
+    return server.cluster_node_timeout * CLUSTER_FAIL_REPORT_VALIDITY_MULT;
 }
 
 /* Only primaries that own slots have voting rights.
@@ -1248,11 +1267,12 @@ void clusterUpdateMyselfFlags(void) {
     myself->flags &= ~CLUSTER_NODE_NOFAILOVER;
     myself->flags |= nofailover;
     myself->flags |= CLUSTER_NODE_EXTENSIONS_SUPPORTED |
+                     CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED |
                      CLUSTER_NODE_LIGHT_HDR_PUBLISH_SUPPORTED |
                      CLUSTER_NODE_LIGHT_HDR_MODULE_SUPPORTED |
                      CLUSTER_NODE_MULTI_MEET_SUPPORTED;
     if (myself->flags != oldflags) {
-        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_UPDATE_STATE);
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_UPDATE_STATE | CLUSTER_TODO_BROADCAST_ALL);
     }
 }
 
@@ -1264,7 +1284,7 @@ void clusterUpdateMyselfAnnouncedPorts(void) {
     if (!myself) return;
     deriveAnnouncedPorts(&myself->tcp_port, &myself->tls_port, &myself->cport,
                          &myself->announce_client_tcp_port, &myself->announce_client_tls_port);
-    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_BROADCAST_ALL);
 }
 
 /* We want to take myself->ip in sync with the cluster-announce-ip option.
@@ -1295,15 +1315,15 @@ void clusterUpdateMyselfIp(void) {
         } else {
             myself->ip[0] = '\0'; /* Force autodetection. */
         }
-        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_BROADCAST_ALL);
     }
 }
 
-static void updateSdsExtensionField(char **field, const char *value) {
+static int updateSdsExtensionField(char **field, const char *value) {
     if (value != NULL && !strcmp(value, *field)) {
-        return;
+        return 0;
     } else if (value == NULL && sdslen(*field) == 0) {
-        return;
+        return 0;
     }
 
     if (value != NULL) {
@@ -1312,45 +1332,48 @@ static void updateSdsExtensionField(char **field, const char *value) {
         sdsclear(*field);
     }
     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+    return 1;
 }
 
 /* Update the hostname for the specified node with the provided C string. */
-static void updateAnnouncedHostname(clusterNode *node, char *value) {
-    updateSdsExtensionField(&node->hostname, value);
+static int updateAnnouncedHostname(clusterNode *node, char *value) {
+    return updateSdsExtensionField(&node->hostname, value);
 }
 
-static void updateAnnouncedHumanNodename(clusterNode *node, char *value) {
-    updateSdsExtensionField(&node->human_nodename, value);
+static int updateAnnouncedHumanNodename(clusterNode *node, char *value) {
+    return updateSdsExtensionField(&node->human_nodename, value);
 }
 
-static void updateAvailabilityZone(clusterNode *node, char *value) {
-    updateSdsExtensionField(&node->availability_zone, value);
+static int updateAvailabilityZone(clusterNode *node, char *value) {
+    return updateSdsExtensionField(&node->availability_zone, value);
 }
 
-static void updateAnnouncedClientIpV4(clusterNode *node, char *value) {
-    updateSdsExtensionField(&node->announce_client_ipv4, value);
+static int updateAnnouncedClientIpV4(clusterNode *node, char *value) {
+    return updateSdsExtensionField(&node->announce_client_ipv4, value);
 }
 
-static void updateAnnouncedClientIpV6(clusterNode *node, char *value) {
-    updateSdsExtensionField(&node->announce_client_ipv6, value);
+static int updateAnnouncedClientIpV6(clusterNode *node, char *value) {
+    return updateSdsExtensionField(&node->announce_client_ipv6, value);
 }
 
-static void updateAnnouncedClientPort(clusterNode *node, int value) {
+static int updateAnnouncedClientPort(clusterNode *node, int value) {
     if (value == node->announce_client_tcp_port) {
-        return;
+        return 0;
     }
 
     node->announce_client_tcp_port = value;
     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+    return 1;
 }
 
-static void updateAnnouncedClientTlsPort(clusterNode *node, int value) {
+static int updateAnnouncedClientTlsPort(clusterNode *node, int value) {
     if (value == node->announce_client_tls_port) {
-        return;
+        return 0;
     }
 
     node->announce_client_tls_port = value;
     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+    return 1;
 }
 
 static void updateShardId(clusterNode *node, const char *shard_id) {
@@ -1379,7 +1402,9 @@ static void updateShardId(clusterNode *node, const char *shard_id) {
         clusterRemoveNodeFromShard(node);
         memcpy(node->shard_id, shard_id, CLUSTER_NAMELEN);
         clusterAddNodeToShard(shard_id, node);
-        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+        int flags = CLUSTER_TODO_SAVE_CONFIG;
+        if (node == myself) flags |= CLUSTER_TODO_BROADCAST_ALL;
+        clusterDoBeforeSleep(flags);
     }
     if (shard_id && myself != node && myself->replicaof == node) {
         if (memcmp(myself->shard_id, shard_id, CLUSTER_NAMELEN) != 0) {
@@ -1404,27 +1429,37 @@ static inline uint64_t nodeEpoch(clusterNode *n) {
 /* Update my hostname based on server configuration values */
 void clusterUpdateMyselfHostname(void) {
     if (!myself) return;
-    updateAnnouncedHostname(myself, server.cluster_announce_hostname);
+    if (updateAnnouncedHostname(myself, server.cluster_announce_hostname)) {
+        clusterDoBeforeSleep(CLUSTER_TODO_BROADCAST_ALL);
+    }
 }
 
 void clusterUpdateMyselfHumanNodename(void) {
     if (!myself) return;
-    updateAnnouncedHumanNodename(myself, server.cluster_announce_human_nodename);
+    if (updateAnnouncedHumanNodename(myself, server.cluster_announce_human_nodename)) {
+        clusterDoBeforeSleep(CLUSTER_TODO_BROADCAST_ALL);
+    }
 }
 
 void clusterUpdateMyselfAvailabilityZone(void) {
     if (!myself) return;
-    updateAvailabilityZone(myself, server.availability_zone);
+    if (updateAvailabilityZone(myself, server.availability_zone)) {
+        clusterDoBeforeSleep(CLUSTER_TODO_BROADCAST_ALL);
+    }
 }
 
 void clusterUpdateMyselfClientIpV4(void) {
     if (!myself) return;
-    updateAnnouncedClientIpV4(myself, server.cluster_announce_client_ipv4);
+    if (updateAnnouncedClientIpV4(myself, server.cluster_announce_client_ipv4)) {
+        clusterDoBeforeSleep(CLUSTER_TODO_BROADCAST_ALL);
+    }
 }
 
 void clusterUpdateMyselfClientIpV6(void) {
     if (!myself) return;
-    updateAnnouncedClientIpV6(myself, server.cluster_announce_client_ipv6);
+    if (updateAnnouncedClientIpV6(myself, server.cluster_announce_client_ipv6)) {
+        clusterDoBeforeSleep(CLUSTER_TODO_BROADCAST_ALL);
+    }
 }
 
 void clusterInit(void) {
@@ -2603,6 +2638,7 @@ void clearNodeFailureIfNeeded(clusterNode *node) {
         serverLog(LL_NOTICE, "Clear FAIL state for node %.40s (%s): %s is reachable again.", node->name,
                   humanNodename(node), nodeIsReplica(node) ? "replica" : "primary without slots");
         node->flags &= ~CLUSTER_NODE_FAIL;
+        clusterNodeStartFailureReportClear(node);
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE | CLUSTER_TODO_SAVE_CONFIG);
     }
 
@@ -2617,6 +2653,7 @@ void clearNodeFailureIfNeeded(clusterNode *node) {
             "Clear FAIL state for node %.40s (%s): is reachable again and nobody is serving its slots after some time.",
             node->name, humanNodename(node));
         node->flags &= ~CLUSTER_NODE_FAIL;
+        clusterNodeStartFailureReportClear(node);
         clusterDoBeforeSleep(CLUSTER_TODO_UPDATE_STATE | CLUSTER_TODO_SAVE_CONFIG);
     }
 }
@@ -2748,11 +2785,7 @@ int verifyGossipSectionNodeIds(clusterMsgDataGossip *g, uint16_t count) {
  * Note that this function assumes that the packet is already sanity-checked
  * by the caller, not in the content of the gossip section, but in the
  * length. */
-void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
-    uint16_t count = ntohs(hdr->count);
-    clusterMsgDataGossip *g = (clusterMsgDataGossip *)hdr->data.ping.gossip;
-    clusterNode *sender = link->node ? link->node : clusterLookupNode(hdr->sender, CLUSTER_NAMELEN);
-
+static void clusterProcessGossipEntries(clusterMsgDataGossip *g, uint16_t count, clusterNode *sender) {
     /* Abort if the gossip contains invalid node IDs to avoid adding incorrect information to
      * the nodes dictionary. An invalid ID indicates memory corruption on the sender side. */
     int invalid_ids = verifyGossipSectionNodeIds(g, count);
@@ -2881,6 +2914,14 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
         /* Next node */
         g++;
     }
+}
+
+void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
+    uint16_t count = ntohs(hdr->count);
+    clusterMsgDataGossip *g = (clusterMsgDataGossip *)hdr->data.ping.gossip;
+    clusterNode *sender = link->node ? link->node : clusterLookupNode(hdr->sender, CLUSTER_NAMELEN);
+
+    clusterProcessGossipEntries(g, count, sender);
 }
 
 /* IP -> string conversion. 'buf' is supposed to at least be 46 bytes.
@@ -3616,7 +3657,9 @@ static void clusterProcessModulePacket(clusterMsgModule *module_data, clusterNod
 static void clusterProcessLightPacket(clusterNode *sender, clusterLink *link, uint16_t type) {
     clusterMsgLight *hdr = (clusterMsgLight *)link->rcvbuf;
     serverLog(LL_DEBUG, "Processing light packet of type: %s", clusterGetMessageTypeString(type));
-    if (type == CLUSTERMSG_TYPE_PUBLISH || type == CLUSTERMSG_TYPE_PUBLISHSHARD) {
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG) {
+        clusterProcessGossipEntries((clusterMsgDataGossip *)hdr->data.ping.gossip, clusterMsgLightCount(hdr), sender);
+    } else if (type == CLUSTERMSG_TYPE_PUBLISH || type == CLUSTERMSG_TYPE_PUBLISHSHARD) {
         clusterProcessPublishPacket(&hdr->data.publish.msg, type);
     } else if (type == CLUSTERMSG_TYPE_MODULE) {
         clusterProcessModulePacket(&hdr->data.module.msg, sender);
@@ -3627,6 +3670,8 @@ static void clusterProcessLightPacket(clusterNode *sender, clusterLink *link, ui
 
 static inline int messageTypeSupportsLightHdr(uint16_t type) {
     switch (type) {
+    case CLUSTERMSG_TYPE_PING: return 1;
+    case CLUSTERMSG_TYPE_PONG: return 1;
     case CLUSTERMSG_TYPE_PUBLISH: return 1;
     case CLUSTERMSG_TYPE_PUBLISHSHARD: return 1;
     case CLUSTERMSG_TYPE_MODULE: return 1;
@@ -3670,55 +3715,62 @@ int clusterIsValidPacket(clusterLink *link) {
     uint32_t explen; /* expected length of this packet */
 
     if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG || type == CLUSTERMSG_TYPE_MEET) {
-        clusterMsg *msg = toClusterMsg(link->rcvbuf);
-        uint16_t extensions = ntohs(msg->extensions);
-        uint16_t count = ntohs(msg->count);
+        if (is_light) {
+            clusterMsgLight *msg_light = toClusterMsgLight(link->rcvbuf);
+            uint16_t count = clusterMsgLightCount(msg_light);
 
-        explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
-        explen += (sizeof(clusterMsgDataGossip) * count);
+            explen = sizeof(clusterMsgLight) - sizeof(union clusterMsgData);
+            explen += (sizeof(clusterMsgDataGossip) * count);
+        } else {
+            clusterMsg *msg = toClusterMsg(link->rcvbuf);
+            uint16_t extensions = ntohs(msg->extensions);
+            uint16_t count = ntohs(msg->count);
+
+            explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
+            explen += (sizeof(clusterMsgDataGossip) * count);
+
+            /* If there is extension data, which doesn't have a fixed length,
+             * loop through them and validate the length of it now. */
+            if (msg->mflags[0] & CLUSTERMSG_FLAG0_EXT_DATA) {
+                clusterMsgPingExt *ext = getInitialPingExt(msg, count);
+                while (extensions--) {
+                    /* Make sure there is at least enough memory for the extension information so
+                     * we can parse it. */
+                    if ((totlen - explen) < sizeof(clusterMsgPingExt)) {
+                        serverLog(LL_WARNING,
+                                  "Received invalid %s packet with extension data that exceeds "
+                                  "total packet length (%lld)",
+                                  clusterGetMessageTypeString(type), (unsigned long long)totlen);
+                        return 0;
+                    }
+                    uint32_t extlen = getPingExtLength(ext);
+                    if (extlen % 8 != 0) {
+                        serverLog(LL_WARNING, "Received a %s packet without proper padding (%d bytes)",
+                                  clusterGetMessageTypeString(type), (int)extlen);
+                        return 0;
+                    }
+                    /* Similar check to earlier, but we want to make sure the extension length is valid
+                     * this time. */
+                    if ((totlen - explen) < extlen) {
+                        serverLog(LL_WARNING,
+                                  "Received invalid %s packet with extension data that exceeds "
+                                  "total packet length (%lld)",
+                                  clusterGetMessageTypeString(type), (unsigned long long)totlen);
+                        return 0;
+                    }
+                    explen += extlen;
+                    ext = getNextPingExt(ext);
+                }
+            }
+        }
 
         /* Make sure that the number of gossip messages fit in the remaining
          * space in the message. */
         if (totlen < explen) {
             serverLog(LL_WARNING,
-                      "Received invalid %s packet with gossip count %d that exceeds "
-                      "total packet length (%lld)",
-                      clusterGetMessageTypeString(type), count, (unsigned long long)totlen);
+                      "Received invalid %s packet with gossip count that exceeds total packet length (%lld)",
+                      clusterGetMessageTypeString(type), (unsigned long long)totlen);
             return 0;
-        }
-
-        /* If there is extension data, which doesn't have a fixed length,
-         * loop through them and validate the length of it now. */
-        if (msg->mflags[0] & CLUSTERMSG_FLAG0_EXT_DATA) {
-            clusterMsgPingExt *ext = getInitialPingExt(msg, count);
-            while (extensions--) {
-                /* Make sure there is at least enough memory for the extension information so
-                 * we can parse it. */
-                if ((totlen - explen) < sizeof(clusterMsgPingExt)) {
-                    serverLog(LL_WARNING,
-                              "Received invalid %s packet with extension data that exceeds "
-                              "total packet length (%lld)",
-                              clusterGetMessageTypeString(type), (unsigned long long)totlen);
-                    return 0;
-                }
-                uint32_t extlen = getPingExtLength(ext);
-                if (extlen % 8 != 0) {
-                    serverLog(LL_WARNING, "Received a %s packet without proper padding (%d bytes)",
-                              clusterGetMessageTypeString(type), (int)extlen);
-                    return 0;
-                }
-                /* Similar check to earlier, but we want to make sure the extension length is valid
-                 * this time. */
-                if ((totlen - explen) < extlen) {
-                    serverLog(LL_WARNING,
-                              "Received invalid %s packet with extension data that exceeds "
-                              "total packet length (%lld)",
-                              clusterGetMessageTypeString(type), (unsigned long long)totlen);
-                    return 0;
-                }
-                explen += extlen;
-                ext = getNextPingExt(ext);
-            }
         }
     } else if (type == CLUSTERMSG_TYPE_FAIL) {
         explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
@@ -3819,6 +3871,19 @@ int clusterProcessPacket(clusterLink *link) {
         clusterNode *sender = link->node;
         sender->data_received = now;
         clusterProcessLightPacket(sender, link, type);
+        if (type == CLUSTERMSG_TYPE_PING) {
+            clusterSendPing(link, CLUSTERMSG_TYPE_PONG);
+        } else if (!link->inbound && type == CLUSTERMSG_TYPE_PONG) {
+            link->node->pong_received = now;
+            link->node->ping_sent = 0;
+            if (nodeTimedOut(link->node)) {
+                link->node->flags &= ~CLUSTER_NODE_PFAIL;
+                clusterNodeStartFailureReportClear(link->node);
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_UPDATE_STATE);
+            } else if (nodeFailed(link->node)) {
+                clearNodeFailureIfNeeded(link->node);
+            }
+        }
         return 1;
     }
 
@@ -3841,6 +3906,13 @@ int clusterProcessPacket(clusterLink *link) {
         /* Check if the node supports extensions. */
         if (linkSupportsExtension(link)) {
             sender->flags |= CLUSTER_NODE_EXTENSIONS_SUPPORTED;
+        }
+
+        /* Check if the node supports light publish message hdr */
+        if (flags & CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED) {
+            sender->flags |= CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED;
+        } else {
+            sender->flags &= ~CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED;
         }
 
         /* Check if the node supports light publish message hdr */
@@ -4123,6 +4195,7 @@ int clusterProcessPacket(clusterLink *link) {
              * conditions detected by clearNodeFailureIfNeeded(). */
             if (nodeTimedOut(link->node)) {
                 link->node->flags &= ~CLUSTER_NODE_PFAIL;
+                clusterNodeStartFailureReportClear(link->node);
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_UPDATE_STATE);
             } else if (nodeFailed(link->node)) {
                 clearNodeFailureIfNeeded(link->node);
@@ -4745,9 +4818,7 @@ static void clusterBuildMessageHdr(clusterMsg *hdr, int type, size_t msglen) {
 
 /* Set the i-th entry of the gossip section in the message pointed by 'hdr'
  * to the info of the specified node 'n'. */
-void clusterSetGossipEntry(clusterMsg *hdr, int i, clusterNode *n) {
-    clusterMsgDataGossip *gossip;
-    gossip = &(hdr->data.ping.gossip[i]);
+static void clusterSetGossipEntryData(clusterMsgDataGossip *gossip, clusterNode *n) {
     memcpy(gossip->nodename, n->name, CLUSTER_NAMELEN);
     gossip->ping_sent = htonl(n->ping_sent / 1000);
     gossip->pong_received = htonl(n->pong_received / 1000);
@@ -4764,9 +4835,38 @@ void clusterSetGossipEntry(clusterMsg *hdr, int i, clusterNode *n) {
     gossip->notused1 = 0;
 }
 
+void clusterSetGossipEntry(clusterMsg *hdr, int i, clusterNode *n) {
+    clusterSetGossipEntryData(&(hdr->data.ping.gossip[i]), n);
+}
+
+static int clusterNodeNeedsFailureReportClear(clusterNode *node, mstime_t now) {
+    return node->fail_report_clear_time > now;
+}
+
+static void clusterNodeStartFailureReportClear(clusterNode *node) {
+    node->fail_report_clear_time = mstime() + clusterFailureReportClearValidity();
+}
+
+static int clusterShouldSendFullHeartbeat(clusterLink *link, int type, int force_full) {
+    if (force_full) return 1;
+    if (!link->node) return 1;
+    if (type != CLUSTERMSG_TYPE_PING && type != CLUSTERMSG_TYPE_PONG) return 1;
+    if (link->node == myself || nodeInHandshake(link->node) || nodeInMeetState(link->node)) return 1;
+    if (!(link->node->flags & CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED)) return 1;
+    if (mstime() - link->node->last_full_heartbeat_sent >= clusterFullHeartbeatInterval()) {
+        return 1;
+    }
+    if (server.cluster->mf_end) return 1;
+    return 0;
+}
+
 /* Send a PING or PONG packet to the specified node, making sure to add enough
  * gossip information. */
 void clusterSendPing(clusterLink *link, int type) {
+    clusterSendPingWithOptions(link, type, 0);
+}
+
+void clusterSendPingWithOptions(clusterLink *link, int type, int force_full) {
     serverLog(LL_DEBUG, "Sending %s packet to node %.40s (%s) on %s link",
               clusterGetMessageTypeString(type),
               clusterLinkGetNodeName(link),
@@ -4778,6 +4878,9 @@ void clusterSendPing(clusterLink *link, int type) {
     int gossipcount = 0; /* Number of gossip sections added so far. */
     int wanted;          /* Number of gossip sections we want to append if possible. */
     int estlen;          /* Upper bound on estimated packet length */
+    mstime_t now = mstime();
+    int use_full = clusterShouldSendFullHeartbeat(link, type, force_full);
+    uint16_t msgtype = type;
     /* freshnodes is the max number of nodes we can hope to append at all:
      * nodes available minus two (ourself and the node we are sending the
      * message to). However practically there may be less valid nodes since
@@ -4815,25 +4918,50 @@ void clusterSendPing(clusterLink *link, int type) {
     if (wanted < 3) wanted = 3;
     if (wanted > freshnodes) wanted = freshnodes;
 
-    /* Include all the nodes in PFAIL state, so that failure reports are
+    /* Include all the nodes in FAIL/PFAIL state, so that failure reports are
      * faster to propagate to go from PFAIL to FAIL state. */
-    int pfail_wanted = server.cluster->stats_pfail_nodes;
+    int suspect_wanted = 0;
+    int clear_wanted = 0;
+    dictIterator *di = dictGetSafeIterator(server.cluster->nodes);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        if (node == myself || node == link->node) continue;
+        if (node->flags & (CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR)) continue;
+        if (node->flags & (CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)) {
+            suspect_wanted++;
+        } else if (clusterNodeNeedsFailureReportClear(node, now)) {
+            clear_wanted++;
+        }
+    }
+    dictReleaseIterator(di);
 
     /* Compute the maximum estlen to allocate our buffer. We'll fix the estlen
      * later according to the number of gossip sections we really were able
      * to put inside the packet. */
-    estlen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
-    estlen += (sizeof(clusterMsgDataGossip) * (wanted + pfail_wanted));
+    estlen = (use_full ? sizeof(clusterMsg) : sizeof(clusterMsgLight)) - sizeof(union clusterMsgData);
+    if (use_full) {
+        estlen += (sizeof(clusterMsgDataGossip) * (wanted + suspect_wanted + clear_wanted));
+    } else {
+        estlen += (sizeof(clusterMsgDataGossip) * (suspect_wanted + clear_wanted));
+        msgtype |= CLUSTERMSG_LIGHT;
+    }
     /* If the link or the node indicates that it supports extensions, then we
      * pass the extensions. */
-    if (linkSupportsExtension(link) || (link->node && nodeSupportsExtensions(link->node))) {
+    if (use_full && (linkSupportsExtension(link) || (link->node && nodeSupportsExtensions(link->node)))) {
         estlen += writePingExtensions(NULL, 0);
     }
-    /* Note: clusterBuildMessageHdr() expects the buffer to be always at least
-     * sizeof(clusterMsg) or more. */
-    if (estlen < (int)sizeof(clusterMsg)) estlen = sizeof(clusterMsg);
-    clusterMsgSendBlock *msgblock = createClusterMsgSendBlock(type, estlen);
-    clusterMsg *hdr = getMessageFromSendBlock(msgblock);
+    if (use_full) {
+        /* Note: clusterBuildMessageHdr() expects the buffer to be always at least
+         * sizeof(clusterMsg) or more. */
+        if (estlen < (int)sizeof(clusterMsg)) estlen = sizeof(clusterMsg);
+    } else if (estlen < (int)sizeof(clusterMsgLight)) {
+        estlen = sizeof(clusterMsgLight);
+    }
+    clusterMsgSendBlock *msgblock = createClusterMsgSendBlock(msgtype, estlen);
+    clusterMsg *hdr = use_full ? getMessageFromSendBlock(msgblock) : NULL;
+    clusterMsgLight *hdr_light = use_full ? NULL : getLightMessageFromSendBlock(msgblock);
+    clusterMsgDataGossip *gossip = use_full ? hdr->data.ping.gossip : hdr_light->data.ping.gossip;
 
     if (!link->inbound) {
         if (type == CLUSTERMSG_TYPE_PING)
@@ -4841,69 +4969,80 @@ void clusterSendPing(clusterLink *link, int type) {
         else if (type == CLUSTERMSG_TYPE_MEET)
             link->node->meet_sent = mstime();
     }
-
-    /* Populate the gossip fields.
-     * Use dictGetSomeKeys() to sample candidates in a single batch instead
-     * of calling dictGetRandomKey() in a retry loop. We over-allocate to
-     * have enough candidates after filtering out ineligible nodes.
-     * dictGetSomeKeys() picks a random starting point each call, so over
-     * many ping rounds all nodes get even coverage without needing an
-     * explicit shuffle. */
-    int candidates_wanted = wanted + 2; /* +2 for myself and link->node */
-    if (candidates_wanted > (int)dictSize(server.cluster->nodes))
-        candidates_wanted = dictSize(server.cluster->nodes);
-    dictEntry **candidates = zmalloc(sizeof(dictEntry *) * candidates_wanted);
-    unsigned int ncandidates = dictGetSomeKeys(server.cluster->nodes, candidates, candidates_wanted);
-
-    for (unsigned int i = 0; i < ncandidates && gossipcount < wanted; i++) {
-        clusterNode *this = dictGetVal(candidates[i]);
-
-        /* Don't include this node: the whole packet header is about us
-         * already, so we just gossip about other nodes.
-         * Also, don't include the receiver. Receiver will not update its state
-         * based on gossips about itself. */
-        if (this == myself || this == link->node) continue;
-
-        /* PFAIL nodes will be added later. */
-        if (this->flags & CLUSTER_NODE_PFAIL) continue;
-
-        /* In the gossip section don't include:
-         * 1) Nodes in HANDSHAKE state.
-         * 3) Nodes with the NOADDR flag set.
-         * 4) Disconnected nodes if they don't have configured slots.
-         */
-        if (this->flags & (CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR) ||
-            (this->link == NULL && this->numslots == 0)) {
-            continue;
-        }
-
-        /* Do not add a node we already have. */
-        if (this->last_in_ping_gossip == cluster_pings_sent) continue;
-
-        /* Add it */
-        clusterSetGossipEntry(hdr, gossipcount, this);
-        this->last_in_ping_gossip = cluster_pings_sent;
-        gossipcount++;
+    if (use_full && link->node) {
+        link->node->last_full_heartbeat_sent = now;
     }
-    zfree(candidates);
 
-    /* If there are PFAIL nodes, add them at the end. */
-    if (pfail_wanted) {
-        dictIterator *di;
-        dictEntry *de;
-
+    if (!use_full) {
         di = dictGetSafeIterator(server.cluster->nodes);
-        while ((de = dictNext(di)) != NULL && pfail_wanted > 0) {
+        while ((de = dictNext(di)) != NULL) {
             clusterNode *node = dictGetVal(de);
-            if (node->flags & CLUSTER_NODE_HANDSHAKE) continue;
-            if (node->flags & CLUSTER_NODE_NOADDR) continue;
-            if (!(node->flags & CLUSTER_NODE_PFAIL)) continue;
-            clusterSetGossipEntry(hdr, gossipcount, node);
+            if (node == myself || node == link->node) continue;
+            if (node->flags & (CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR)) continue;
+            if (!(node->flags & (CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)) && !clusterNodeNeedsFailureReportClear(node, now))
+                continue;
+            clusterSetGossipEntryData(&gossip[gossipcount], node);
             gossipcount++;
-            /* We take the count of the slots we allocated, since the
-             * PFAIL stats may not match perfectly with the current number
-             * of PFAIL nodes. */
-            pfail_wanted--;
+        }
+        dictReleaseIterator(di);
+    } else {
+        /* Populate the gossip fields.
+         * Use dictGetSomeKeys() to sample candidates in a single batch instead
+         * of calling dictGetRandomKey() in a retry loop. We over-allocate to
+         * have enough candidates after filtering out ineligible nodes.
+         * dictGetSomeKeys() picks a random starting point each call, so over
+         * many ping rounds all nodes get even coverage without needing an
+         * explicit shuffle. */
+        int candidates_wanted = wanted + 2; /* +2 for myself and link->node */
+        if (candidates_wanted > (int)dictSize(server.cluster->nodes))
+            candidates_wanted = dictSize(server.cluster->nodes);
+        dictEntry **candidates = zmalloc(sizeof(dictEntry *) * candidates_wanted);
+        unsigned int ncandidates = dictGetSomeKeys(server.cluster->nodes, candidates, candidates_wanted);
+
+        for (unsigned int i = 0; i < ncandidates && gossipcount < wanted; i++) {
+            clusterNode *this = dictGetVal(candidates[i]);
+
+            /* Don't include this node: the whole packet header is about us
+             * already, so we just gossip about other nodes.
+             * Also, don't include the receiver. Receiver will not update its state
+             * based on gossips about itself. */
+            if (this == myself || this == link->node) continue;
+
+            /* FAIL and clear-retransmit nodes are added later. */
+            if (this->flags & (CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)) continue;
+            if (clusterNodeNeedsFailureReportClear(this, now)) continue;
+
+            /* In the gossip section don't include:
+             * 1) Nodes in HANDSHAKE state.
+             * 3) Nodes with the NOADDR flag set.
+             * 4) Disconnected nodes if they don't have configured slots.
+             */
+            if (this->flags & (CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR) ||
+                (this->link == NULL && this->numslots == 0)) {
+                continue;
+            }
+
+            /* Do not add a node we already have. */
+            if (this->last_in_ping_gossip == cluster_pings_sent) continue;
+
+            /* Add it */
+            clusterSetGossipEntryData(&gossip[gossipcount], this);
+            this->last_in_ping_gossip = cluster_pings_sent;
+            gossipcount++;
+        }
+        zfree(candidates);
+
+        /* Add all suspect or recovered nodes so failure information converges
+         * independently of the random healthy gossip sample. */
+        di = dictGetSafeIterator(server.cluster->nodes);
+        while ((de = dictNext(di)) != NULL) {
+            clusterNode *node = dictGetVal(de);
+            if (node == myself || node == link->node) continue;
+            if (node->flags & (CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR)) continue;
+            if (!(node->flags & (CLUSTER_NODE_PFAIL | CLUSTER_NODE_FAIL)) && !clusterNodeNeedsFailureReportClear(node, now))
+                continue;
+            clusterSetGossipEntryData(&gossip[gossipcount], node);
+            gossipcount++;
         }
         dictReleaseIterator(di);
     }
@@ -4911,17 +5050,22 @@ void clusterSendPing(clusterLink *link, int type) {
     /* Compute the actual total length and send! */
     uint32_t totlen = 0;
 
-    if (linkSupportsExtension(link) || (link->node && nodeSupportsExtensions(link->node))) {
+    if (use_full && (linkSupportsExtension(link) || (link->node && nodeSupportsExtensions(link->node)))) {
         totlen += writePingExtensions(hdr, gossipcount);
-    } else {
+    } else if (use_full) {
         serverLog(LL_DEBUG, "Unable to send extensions data, however setting ext data flag to true");
         hdr->mflags[0] |= CLUSTERMSG_FLAG0_EXT_DATA;
     }
-    totlen += sizeof(clusterMsg) - sizeof(union clusterMsgData);
+    totlen += (use_full ? sizeof(clusterMsg) : sizeof(clusterMsgLight)) - sizeof(union clusterMsgData);
     totlen += (sizeof(clusterMsgDataGossip) * gossipcount);
     serverAssert(gossipcount < USHRT_MAX);
-    hdr->count = htons(gossipcount);
-    hdr->totlen = htonl(totlen);
+    if (use_full) {
+        hdr->count = htons(gossipcount);
+        hdr->totlen = htonl(totlen);
+    } else {
+        clusterMsgLightSetCount(hdr_light, gossipcount);
+        hdr_light->totlen = htonl(totlen);
+    }
 
     clusterSendMessage(link, msgblock);
     clusterMsgSendBlockDecrRefCount(msgblock);
@@ -4958,7 +5102,7 @@ void clusterBroadcastPong(int target) {
                                 (node->replicaof == myself || node->replicaof == myself->replicaof);
             if (!local_replica) continue;
         }
-        clusterSendPing(node->link, CLUSTERMSG_TYPE_PONG);
+        clusterSendPingWithOptions(node->link, CLUSTERMSG_TYPE_PONG, 1);
     }
     dictReleaseIterator(di);
 }
@@ -6158,6 +6302,10 @@ void clusterCron(void) {
          * a too big delay. */
         mstime_t ping_interval =
             server.cluster_ping_interval ? server.cluster_ping_interval : server.cluster_node_timeout / 2;
+        if (node->link && node->ping_sent == 0 && (now - node->last_full_heartbeat_sent) > ping_interval) {
+            clusterSendPingWithOptions(node->link, CLUSTERMSG_TYPE_PING, 1);
+            continue;
+        }
         if (node->link && node->ping_sent == 0 && (now - node->pong_received) > ping_interval) {
             clusterSendPing(node->link, CLUSTERMSG_TYPE_PING);
             continue;

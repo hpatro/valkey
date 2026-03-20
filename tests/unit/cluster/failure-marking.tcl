@@ -178,3 +178,31 @@ start_cluster 3 1 {tags {external:skip cluster}} {
         }
     }
 }
+
+start_cluster 3 1 {tags {external:skip cluster} overrides {cluster-ping-interval 100 cluster-node-timeout 3000}} {
+    test "Failure report clears keep retransmitting until stale reports are removed" {
+        set primary0_pid [srv 0 pid]
+        set replica0_pid [srv -3 pid]
+        set replica0_id [dict get [cluster_get_myself 3] id]
+
+        pause_process $replica0_pid
+
+        wait_for_condition 1000 50 {
+            [R 0 CLUSTER COUNT-FAILURE-REPORTS $replica0_id] > 0
+        } else {
+            fail "Expected at least one external failure report before recovery"
+        }
+
+        pause_process $primary0_pid
+        resume_process $replica0_pid
+
+        after 2500
+        resume_process $primary0_pid
+
+        wait_for_condition 1000 50 {
+            [R 0 CLUSTER COUNT-FAILURE-REPORTS $replica0_id] == 0
+        } else {
+            fail "Recovered node failure report was not cleared after missing the initial recovery traffic"
+        }
+    }
+}
