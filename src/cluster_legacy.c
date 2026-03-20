@@ -3729,6 +3729,16 @@ int clusterIsValidPacket(clusterLink *link) {
             explen = sizeof(clusterMsg) - sizeof(union clusterMsgData);
             explen += (sizeof(clusterMsgDataGossip) * count);
 
+            /* Validate that the gossip section fits before walking extension
+             * headers, otherwise a malformed count can move the cursor past
+             * the end of the packet. */
+            if (totlen < explen) {
+                serverLog(LL_WARNING,
+                          "Received invalid %s packet with gossip count that exceeds total packet length (%lld)",
+                          clusterGetMessageTypeString(type), (unsigned long long)totlen);
+                return 0;
+            }
+
             /* If there is extension data, which doesn't have a fixed length,
              * loop through them and validate the length of it now. */
             if (msg->mflags[0] & CLUSTERMSG_FLAG0_EXT_DATA) {
@@ -4847,12 +4857,17 @@ static void clusterNodeStartFailureReportClear(clusterNode *node) {
     node->fail_report_clear_time = mstime() + clusterFailureReportClearValidity();
 }
 
+static inline bool nodeSupportsLightMsgHdrForPing(clusterNode *n) {
+    return n->link && n->pong_received >= n->link->ctime &&
+           (n->flags & CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED);
+}
+
 static int clusterShouldSendFullHeartbeat(clusterLink *link, int type, int force_full) {
     if (force_full) return 1;
     if (!link->node) return 1;
     if (type != CLUSTERMSG_TYPE_PING && type != CLUSTERMSG_TYPE_PONG) return 1;
     if (link->node == myself || nodeInHandshake(link->node) || nodeInMeetState(link->node)) return 1;
-    if (!(link->node->flags & CLUSTER_NODE_LIGHT_HDR_PING_SUPPORTED)) return 1;
+    if (!nodeSupportsLightMsgHdrForPing(link->node)) return 1;
     if (mstime() - link->node->last_full_heartbeat_sent >= clusterFullHeartbeatInterval()) {
         return 1;
     }
