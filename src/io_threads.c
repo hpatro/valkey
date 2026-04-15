@@ -25,14 +25,14 @@ static mpscQueue io_shared_outbox = {0};
 // Main -> IO (Thread-Specific) for tasks that must run on specific IO thread where IO threads check their private inbox before the shared queue
 static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
 static size_t io_jobs_submitted;
-static atomic_size_t io_jobs_finished;
+static _Atomic(size_t) io_jobs_finished;
 static size_t cluster_io_pending_responses;
 static int io_threads_initialized = 0;
 _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
 /* Job Types for Tagged Pointers
  * We use the lower 3 bits of the pointer to store the job type.
- * Requires data pointers to be 8-byte aligned (jemalloc with --with-lg-quantum=3). */
+ * Requires data pointers to be 8-byte aligned (standard for zmalloc/ptrs). */
 #define JOB_TAG_MASK 0x7
 #define JOB_PTR_MASK (~(uintptr_t)JOB_TAG_MASK)
 
@@ -71,7 +71,7 @@ static size_t getPendingIOThreadsJobs(void) {
     return io_jobs_submitted - atomic_load_explicit(&io_jobs_finished, memory_order_acquire);
 }
 
-/* Jobs awaiting response from IO threads in the shared outbox path. */
+/* Read/write jobs awaiting response from IO threads. */
 static size_t getPendingIOResponsesCount(void) {
     return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses;
 }
@@ -360,7 +360,7 @@ static void *IOThreadMain(void *myid) {
                 ioThreadWriteToClient((client *)data);
                 break;
             case JOB_REQ_FREE_OBJ:
-                sdsfreeVoid(data);
+                decrRefCount(data);
                 break;
             case JOB_REQ_ACCEPT:
                 ioThreadAccept((client *)data);
@@ -390,7 +390,6 @@ static void *IOThreadMain(void *myid) {
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
-                // ak-todo: check if flushing needs to be included
                 flushPendingIOResponses(0);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
@@ -886,10 +885,8 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
 
-    void *job = tagJob(objectGetVal(obj), JOB_REQ_FREE_OBJ);
+    void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
     if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) return C_ERR;
-    objectSetVal(obj, NULL);
-    decrRefCount(obj);
     io_jobs_submitted++;
     server.stat_io_freed_objects++;
     return C_OK;
@@ -931,19 +928,19 @@ void trySendPollJobToIOThreads(void) {
         return;
     }
 
+    void *job = tagJob(server.el, JOB_REQ_POLL);
+
     server.io_poll_state = AE_IO_STATE_POLL;
     aeSetPollProtect(server.el, 1);
 
     /* Use SPMC to minimize polling overhead. At high thread counts, use private SPSC queues for lower latency. */
     if (server.active_io_threads_num <= 9) {
-        void *job = tagJob(server.el, JOB_REQ_POLL);
         if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) {
             server.io_poll_state = AE_IO_STATE_NONE;
             aeSetPollProtect(server.el, 0);
             return;
         }
     } else {
-        void *job = tagJob(server.el, JOB_SPSC_POLL);
         cur_epoll_thread = ((cur_epoll_thread) % (server.active_io_threads_num - 1)) + 1;
         if (unlikely(spscIsFull(&io_private_inbox[cur_epoll_thread]))) {
             server.io_poll_state = AE_IO_STATE_NONE;
@@ -1046,8 +1043,6 @@ static void handleReadJobs(client **read_jobs, int read_count) {
     if (read_count) {
         server.stat_io_reads_processed += read_count;
         processClientsCommandsBatch();
-        /* Any responses that failed to enqueue to IO threads need to be handled now */
-        handleClientsWithPendingWrites();
     }
 }
 
@@ -1066,6 +1061,9 @@ static void handleWriteJobs(client **write_jobs, int write_count) {
 #define JOB_BATCH_SIZE (16)
 int processIOThreadsResponses(void) {
     /* We don't check for threads number  since some threads may return jobs then deactivate/shut-down */
+
+    /* Quick check if any pending operations exist */
+    if (getPendingIOResponsesCount() == 0) return 0;
 
     int total_processed = 0;
     void *jobs[JOB_BATCH_SIZE];
