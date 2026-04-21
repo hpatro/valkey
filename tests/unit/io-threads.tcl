@@ -58,7 +58,6 @@ proc activate_io_threads_and_wait {} {
     wait_for_io_threads_to_go_idle
 }
 
-if {0} {
 start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {enable-debug-command {yes} io-threads 5}} {
     # Skip if non io-threads mode - as it is relevant only for io-threads mode
     assert_equal {io-threads 5} [r config get io-threads]
@@ -124,5 +123,4 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
             assert {$used_active_time < ($sleep_time_ms/1000)}
         }
     }
-}
 }
