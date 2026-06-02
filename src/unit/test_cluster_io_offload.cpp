@@ -403,6 +403,11 @@ TEST_F(ClusterIOOffloadTest, AcceptDispatchSetsPendingFlag) {
 
     EXPECT_EQ(res, C_OK);
     EXPECT_NE(fc->conn.flags & CONN_FLAG_ACCEPT_OFFLOAD_PENDING, 0);
+
+    /* Undo synthetic dispatch state so TearDown can free the connection cleanly. */
+    connSetPostponeUpdateState(&fc->conn, 0);
+    connDecrRefs(&fc->conn);
+    fc->conn.flags &= ~CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
 }
 
 TEST_F(ClusterIOOffloadTest, AcceptCompletionAcceptingKeepsConnectionOpen) {
