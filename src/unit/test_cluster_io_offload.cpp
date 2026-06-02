@@ -148,13 +148,13 @@ class ClusterIOOffloadTest : public ::testing::Test {
         testOnlyFreeIOThreadQueues();
     }
 
-    FakeConn *makeConn() {
+    FakeConn *makeConn(ConnOwnerKind owner_kind = CONN_OWNER_CLUSTER_LINK) {
         FakeConn *fc = (FakeConn *)zcalloc(sizeof(FakeConn));
         fc->conn.type = &CT_Fake;
         fc->conn.state = CONN_STATE_CONNECTED;
         fc->conn.fd = -1;
         fc->conn.refs = 1;
-        fc->conn.owner_kind = CONN_OWNER_CLUSTER_LINK;
+        fc->conn.owner_kind = owner_kind;
         fc->written_cap = 4096;
         fc->written = (unsigned char *)zmalloc(fc->written_cap);
         owned_conns[owned_conns_count++] = fc;
@@ -396,7 +396,7 @@ TEST_F(ClusterIOOffloadTest, WriteCompletionPartialSendUpdatesHeadOffset) {
 }
 
 TEST_F(ClusterIOOffloadTest, AcceptDispatchSetsPendingFlag) {
-    FakeConn *fc = makeConn();
+    FakeConn *fc = makeConn(CONN_OWNER_CLIENT);
     fc->conn.flags |= CONN_FLAG_ALLOW_ACCEPT_OFFLOAD;
 
     int res = trySendClusterAcceptToIOThreads(&fc->conn);
@@ -406,7 +406,7 @@ TEST_F(ClusterIOOffloadTest, AcceptDispatchSetsPendingFlag) {
 }
 
 TEST_F(ClusterIOOffloadTest, AcceptCompletionAcceptingKeepsConnectionOpen) {
-    FakeConn *fc = makeConn();
+    FakeConn *fc = makeConn(CONN_OWNER_CLIENT);
     fc->conn.flags |= CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
     fc->conn.state = CONN_STATE_ACCEPTING;
     fc->conn.refs = 1;
@@ -418,7 +418,7 @@ TEST_F(ClusterIOOffloadTest, AcceptCompletionAcceptingKeepsConnectionOpen) {
 }
 
 TEST_F(ClusterIOOffloadTest, AcceptCompletionConnectedCreatesLink) {
-    FakeConn *fc = makeConn();
+    FakeConn *fc = makeConn(CONN_OWNER_CLIENT);
     fc->conn.flags |= CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
     fc->conn.state = CONN_STATE_CONNECTED;
     fc->conn.refs = 1;
@@ -432,7 +432,7 @@ TEST_F(ClusterIOOffloadTest, AcceptCompletionConnectedCreatesLink) {
 }
 
 TEST_F(ClusterIOOffloadTest, AcceptCompletionAssertsPrivateDataStillNull) {
-    FakeConn *fc = makeConn();
+    FakeConn *fc = makeConn(CONN_OWNER_CLIENT);
     fc->conn.flags |= CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
     fc->conn.state = CONN_STATE_CONNECTED;
     fc->conn.refs = 1;
