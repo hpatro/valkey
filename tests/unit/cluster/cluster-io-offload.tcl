@@ -21,15 +21,17 @@ start_cluster 3 0 {tags {external:skip cluster} overrides {io-threads 4 io-threa
 
         # Cluster bus gossip is already active; with a 1-byte limit, the next
         # outbound cluster message should force the offending link closed.
-        wait_for_condition 500 10 {
-            [CI 0 total_cluster_links_buffer_limit_exceeded] > $old_exceeded
-        } else {
-            fail "cluster links buffer limit stat did not increase"
+        try {
+            wait_for_condition 500 10 {
+                [CI 0 total_cluster_links_buffer_limit_exceeded] > $old_exceeded
+            } else {
+                fail "cluster links buffer limit stat did not increase"
+            }
+        } finally {
+            # Restore limit and require that the cluster converges back to ok.
+            R 0 config set cluster-link-sendbuf-limit $oldlimit
+            wait_for_cluster_state ok
         }
-
-        # Restore limit and require that the cluster converges back to ok.
-        R 0 config set cluster-link-sendbuf-limit $oldlimit
-        wait_for_cluster_state ok
     }
 
     test "disabling io threads on one node causes sync fallback" {
@@ -37,16 +39,18 @@ start_cluster 3 0 {tags {external:skip cluster} overrides {io-threads 4 io-threa
         R 0 config set io-threads 1
         R 0 config resetstat
 
-        wait_for_condition 500 10 {
-            [CI 0 cluster_stats_messages_sent] > 0 &&
-            [CI 0 cluster_stats_messages_received] > 0 &&
-            [getInfoProperty [R 0 info stats] cluster_io_sync_fallbacks] > 0
-        } else {
-            fail "cluster io sync fallback stat did not increase after disabling io threads"
+        try {
+            wait_for_condition 500 10 {
+                [CI 0 cluster_stats_messages_sent] > 0 &&
+                [CI 0 cluster_stats_messages_received] > 0 &&
+                [getInfoProperty [R 0 info stats] cluster_io_sync_fallbacks] > 0
+            } else {
+                fail "cluster io sync fallback stat did not increase after disabling io threads"
+            }
+        } finally {
+            R 0 config set io-threads $old_threads
+            wait_for_cluster_state ok
         }
-
-        R 0 config set io-threads $old_threads
-        wait_for_cluster_state ok
     }
 } ;# start_cluster
 
