@@ -4732,6 +4732,7 @@ void clusterSnapshotPackets(char *rcvbuf,
 
         /* Validate signature and minimum length. */
         if (memcmp(hdr->sig, "RCmb", 4) != 0) {
+            *snapshot_len = offset; /* preserve any valid prefix already scanned */
             *result = CLUSTER_IO_BAD_HEADER;
             return;
         }
@@ -4741,6 +4742,7 @@ void clusterSnapshotPackets(char *rcvbuf,
         uint32_t minlen = IS_LIGHT_MESSAGE(type) ? CLUSTERMSG_LIGHT_MIN_LEN : CLUSTERMSG_MIN_LEN;
 
         if (totlen < minlen) {
+            *snapshot_len = offset; /* preserve any valid prefix already scanned */
             *result = CLUSTER_IO_BAD_LENGTH;
             return;
         }
@@ -8934,6 +8936,11 @@ void clusterHandleReadCompletion(clusterLink *link) {
 
     /* Handle error results: log and tear down the link. */
     if (result == CLUSTER_IO_BAD_HEADER || result == CLUSTER_IO_BAD_LENGTH) {
+        /* Drain any valid packets that preceded the bad header/length before
+         * closing, so we don't silently drop already-complete messages. */
+        if (link->io_rcvbuf_snapshot_len > 0) {
+            if (!clusterDrainRcvbufSnapshot(link)) return;
+        }
         serverLog(LL_WARNING, "Bad cluster packet header/length from node %.40s:%s (%s)",
                   clusterLinkGetNodeName(link),
                   link->inbound ? "inbound" : "outbound",
