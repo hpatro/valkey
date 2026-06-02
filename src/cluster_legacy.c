@@ -8989,14 +8989,33 @@ void clusterHandleWriteCompletion(clusterLink *link) {
      * recorded how many nodes it fully sent (io_nodes_sent) without
      * modifying the list. We pop them here on the main thread where
      * refcount decrements and memory accounting are safe. */
+    size_t prev_head_offset = link->head_msg_send_offset;
     for (int i = 0; i < link->io_nodes_sent; i++) {
         listNode *head = listFirst(link->send_msg_queue);
         serverAssert(head != NULL);
         clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
+        clusterMsg *msg = getMessageFromSendBlock(msgblock);
+        uint32_t msg_len = ntohl(msg->totlen);
+        size_t start = (i == 0) ? prev_head_offset : 0;
+        clusterBusAddNetworkBytesByType(ntohs(msg->type) & ~CLUSTERMSG_MODIFIER_MASK, msg_len - start, 1);
         uint32_t blocklen = msgblock->totlen;
         listDelNode(link->send_msg_queue, head);
         link->send_msg_queue_mem -= sizeof(listNode) + blocklen;
         server.stat_cluster_links_memory -= sizeof(listNode);
+    }
+
+    /* Account for bytes written into a partially-sent head node. */
+    if (link->io_head_offset > 0) {
+        listNode *head = listFirst(link->send_msg_queue);
+        if (head) {
+            clusterMsgSendBlock *msgblock = (clusterMsgSendBlock *)head->value;
+            clusterMsg *msg = getMessageFromSendBlock(msgblock);
+            size_t start = (link->io_nodes_sent == 0) ? prev_head_offset : 0;
+            size_t partial_bytes = link->io_head_offset - start;
+            if (partial_bytes > 0) {
+                clusterBusAddNetworkBytesByType(ntohs(msg->type) & ~CLUSTERMSG_MODIFIER_MASK, partial_bytes, 1);
+            }
+        }
     }
 
     link->head_msg_send_offset = listLength(link->send_msg_queue) > 0 ? link->io_head_offset : 0;
