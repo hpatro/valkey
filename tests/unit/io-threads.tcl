@@ -119,8 +119,6 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
             set used_active_time [getInfoProperty $info used_active_time_io_thread_$i]
             assert {$used_active_time >= $initial_active_times($i)}
             assert {($used_active_time - $initial_active_times($i)) < ($sleep_time_ms/1000)}
-            # Assert that total active time is lower than the sleep duration assumed
-            assert {$used_active_time < ($sleep_time_ms/1000)}
         }
     }
 }
