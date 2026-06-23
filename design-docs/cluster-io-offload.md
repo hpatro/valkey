@@ -10,7 +10,7 @@ Jobs flow through:
 - `io_shared_outbox` (MPSC): I/O workers -> main thread
 
 If the pool is inactive or enqueue fails, the caller falls back to non-blocking
-I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
+I/O on the main thread and increments `stat_cluster_io_main_thread_fallbacks`.
 
 ## Architecture
 
@@ -245,7 +245,7 @@ loads it with acquire ordering.
 | `CLUSTER_IO_READ_ERROR` / `CLUSTER_IO_EOF` | Log debug, drain queued `rcvbuf` snapshot, then free link |
 | `CLUSTER_IO_WRITE_ERROR` | Log debug, free link |
 | `CONN_STATE_ACCEPTING` after accept completion | Leave connection open; TLS event flow will retry |
-| Pool inactive / queue full | Sync fallback + increment `stat_cluster_io_sync_fallbacks` |
+| Pool inactive / queue full | Sync fallback + increment `stat_cluster_io_main_thread_fallbacks` |
 
 ## Follow-Up
 

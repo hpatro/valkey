@@ -2848,10 +2848,10 @@ void resetServerStats(void) {
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
     server.stat_reply_buffer_shrinks = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
+    server.stat_cluster_threaded_reads_processed = 0;
+    server.stat_cluster_threaded_writes_processed = 0;
+    server.stat_cluster_threaded_accepts_processed = 0;
+    server.stat_cluster_io_main_thread_fallbacks = 0;
     server.stat_cluster_async_closed_links = 0;
     server.stat_cluster_queued_inbound_packets = 0;
     server.stat_reply_buffer_expands = 0;
@@ -3052,10 +3052,10 @@ void initServer(void) {
     server.stat_module_progress = 0;
     for (int j = 0; j < CLIENT_TYPE_COUNT; j++) server.stat_clients_type_memory[j] = 0;
     server.stat_cluster_links_memory = 0;
-    server.stat_cluster_reads_offloaded = 0;
-    server.stat_cluster_writes_offloaded = 0;
-    server.stat_cluster_accepts_offloaded = 0;
-    server.stat_cluster_io_sync_fallbacks = 0;
+    server.stat_cluster_threaded_reads_processed = 0;
+    server.stat_cluster_threaded_writes_processed = 0;
+    server.stat_cluster_threaded_accepts_processed = 0;
+    server.stat_cluster_io_main_thread_fallbacks = 0;
     server.stat_cluster_async_closed_links = 0;
     server.stat_cluster_queued_inbound_packets = 0;
     server.cron_malloc_stats.zmalloc_used = 0;
@@ -6504,12 +6504,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "active_defrag_hits:%lld\r\n", server.stat_active_defrag_hits,
                 "active_defrag_misses:%lld\r\n", server.stat_active_defrag_misses,
                 "active_defrag_key_hits:%lld\r\n", server.stat_active_defrag_key_hits,
-                "cluster_io_reads_offloaded:%lld\r\n", server.stat_cluster_reads_offloaded,
-                "cluster_io_writes_offloaded:%lld\r\n", server.stat_cluster_writes_offloaded,
-                "cluster_io_accepts_offloaded:%lld\r\n", server.stat_cluster_accepts_offloaded,
-                "cluster_io_sync_fallbacks:%lld\r\n", server.stat_cluster_io_sync_fallbacks,
-                "cluster_io_async_closed_links:%lld\r\n", server.stat_cluster_async_closed_links,
-                "cluster_io_queued_inbound_packets:%lld\r\n", server.stat_cluster_queued_inbound_packets,
                 "active_defrag_key_misses:%lld\r\n", server.stat_active_defrag_key_misses,
                 "total_active_defrag_time:%lld\r\n", (server.stat_total_active_defrag_time + current_active_defrag_time) / 1000,
                 "current_active_defrag_time:%lld\r\n", current_active_defrag_time / 1000,

@@ -7630,6 +7630,20 @@ sds genClusterInfoString(sds info) {
     info = sdscatfmt(info, "total_cluster_links_buffer_limit_exceeded:%U\r\n",
                      (unsigned long long)server.cluster->stat_cluster_links_buffer_limit_exceeded);
 
+    info = sdscatfmt(info,
+                     "cluster_io_threaded_reads_processed:%I\r\n"
+                     "cluster_io_threaded_writes_processed:%I\r\n"
+                     "cluster_io_threaded_accepts_processed:%I\r\n"
+                     "cluster_io_main_thread_fallbacks:%I\r\n"
+                     "cluster_io_async_closed_links:%I\r\n"
+                     "cluster_io_queued_inbound_packets:%I\r\n",
+                     (long long)server.stat_cluster_threaded_reads_processed,
+                     (long long)server.stat_cluster_threaded_writes_processed,
+                     (long long)server.stat_cluster_threaded_accepts_processed,
+                     (long long)server.stat_cluster_io_main_thread_fallbacks,
+                     (long long)server.stat_cluster_async_closed_links,
+                     (long long)server.stat_cluster_queued_inbound_packets);
+
     return info;
 }
 

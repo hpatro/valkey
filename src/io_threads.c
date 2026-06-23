@@ -672,7 +672,7 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
 
     /* No I/O thread pool available — synchronous fallback. */
     if (server.active_io_threads_num <= 1) {
-        server.stat_cluster_io_sync_fallbacks++;
+        server.stat_cluster_io_main_thread_fallbacks++;
         return C_ERR;
     }
 
@@ -692,13 +692,13 @@ int trySendClusterReadToIOThreads(struct clusterLink *link) {
         link->io_refs--;
         connDecrRefs(link->conn);
         connSetPostponeUpdateState(link->conn, 0);
-        server.stat_cluster_io_sync_fallbacks++;
+        server.stat_cluster_io_main_thread_fallbacks++;
         return C_ERR;
     }
 
     io_jobs_submitted++;
     cluster_io_pending_responses++;
-    server.stat_cluster_reads_offloaded++;
+    server.stat_cluster_threaded_reads_processed++;
     return C_OK;
 }
 
@@ -727,7 +727,7 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
 
     /* No I/O thread pool available — synchronous fallback. */
     if (server.active_io_threads_num <= 1) {
-        server.stat_cluster_io_sync_fallbacks++;
+        server.stat_cluster_io_main_thread_fallbacks++;
         return C_ERR;
     }
 
@@ -756,13 +756,13 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link) {
         link->io_nodes_sent = 0;
         connDecrRefs(link->conn);
         connSetPostponeUpdateState(link->conn, 0);
-        server.stat_cluster_io_sync_fallbacks++;
+        server.stat_cluster_io_main_thread_fallbacks++;
         return C_ERR;
     }
 
     io_jobs_submitted++;
     cluster_io_pending_responses++;
-    server.stat_cluster_writes_offloaded++;
+    server.stat_cluster_threaded_writes_processed++;
     return C_OK;
 }
 
@@ -774,7 +774,7 @@ int trySendClusterAcceptToIOThreads(connection *conn) {
     /* A cluster accept job is already in flight for this connection. */
     if (conn->flags & CONN_FLAG_ACCEPT_OFFLOAD_PENDING) return C_OK;
     if (server.active_io_threads_num <= 1) {
-        server.stat_cluster_io_sync_fallbacks++;
+        server.stat_cluster_io_main_thread_fallbacks++;
         return C_ERR;
     }
 
@@ -786,13 +786,13 @@ int trySendClusterAcceptToIOThreads(connection *conn) {
         connDecrRefs(conn);
         connSetPostponeUpdateState(conn, 0);
         conn->flags &= ~CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
-        server.stat_cluster_io_sync_fallbacks++;
+        server.stat_cluster_io_main_thread_fallbacks++;
         return C_ERR;
     }
 
     io_jobs_submitted++;
     cluster_io_pending_responses++;
-    server.stat_cluster_accepts_offloaded++;
+    server.stat_cluster_threaded_accepts_processed++;
     return C_OK;
 }
 

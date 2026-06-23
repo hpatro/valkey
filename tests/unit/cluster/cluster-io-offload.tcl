@@ -43,9 +43,9 @@ start_cluster 3 0 {tags {external:skip cluster} overrides {io-threads 4 io-threa
             wait_for_condition 500 10 {
                 [CI 0 cluster_stats_messages_sent] > 0 &&
                 [CI 0 cluster_stats_messages_received] > 0 &&
-                [getInfoProperty [R 0 info stats] cluster_io_sync_fallbacks] > 0
+                [CI 0 cluster_io_main_thread_fallbacks] > 0
             } else {
-                fail "cluster io sync fallback stat did not increase after disabling io threads"
+                fail "cluster io main-thread fallback stat did not increase after disabling io threads"
             }
         } finally {
             R 0 config set io-threads $old_threads
@@ -72,13 +72,13 @@ if {$::tls} {
             }
         }
 
-        test "cluster_io_accepts_offloaded increments under tls reconnect churn" {
+        test "cluster_io_threaded_accepts_processed increments under tls reconnect churn" {
             wait_for_condition 500 10 {
-                [getInfoProperty [R 0 info stats] cluster_io_accepts_offloaded] > 0 || \
-                [getInfoProperty [R 1 info stats] cluster_io_accepts_offloaded] > 0 || \
-                [getInfoProperty [R 2 info stats] cluster_io_accepts_offloaded] > 0
+                [CI 0 cluster_io_threaded_accepts_processed] > 0 || \
+                [CI 1 cluster_io_threaded_accepts_processed] > 0 || \
+                [CI 2 cluster_io_threaded_accepts_processed] > 0
             } else {
-                fail "cluster_io_accepts_offloaded did not increase"
+                fail "cluster_io_threaded_accepts_processed did not increase"
             }
         }
 
