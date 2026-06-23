@@ -148,7 +148,7 @@ class ClusterIOOffloadTest : public ::testing::Test {
         testOnlyFreeIOThreadQueues();
     }
 
-    FakeConn *makeConn(ConnOwnerKind owner_kind = CONN_OWNER_CLUSTER_LINK) {
+    FakeConn *makeConn(ConnectionOwnerKind owner_kind = CONN_OWNER_CLUSTER_LINK) {
         FakeConn *fc = (FakeConn *)zcalloc(sizeof(FakeConn));
         fc->conn.type = &CT_Fake;
         fc->conn.state = CONN_STATE_CONNECTED;

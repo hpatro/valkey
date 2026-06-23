@@ -66,7 +66,7 @@ typedef enum {
 typedef enum {
     CONN_OWNER_CLIENT = 0,   /* private_data points to a client (default) */
     CONN_OWNER_CLUSTER_LINK, /* private_data points to a clusterLink */
-} ConnOwnerKind;
+} ConnectionOwnerKind;
 
 #define CONN_FLAG_CLOSE_SCHEDULED (1 << 0)        /* Closed scheduled by a handler */
 #define CONN_FLAG_WRITE_BARRIER (1 << 1)          /* Write barrier requested */
@@ -172,7 +172,7 @@ struct connection {
     short int flags;
     short int refs;
     unsigned short int iovcnt;
-    ConnOwnerKind owner_kind;
+    ConnectionOwnerKind owner_kind;
     void *private_data;
     ConnectionCallbackFunc conn_handler;
     ConnectionCallbackFunc write_handler;
@@ -410,12 +410,12 @@ static inline void *connGetPrivateData(connection *conn) {
 }
 
 /* Set the owner kind for the connection */
-static inline void connSetOwnerKind(connection *conn, ConnOwnerKind kind) {
+static inline void connSetOwnerKind(connection *conn, ConnectionOwnerKind kind) {
     conn->owner_kind = kind;
 }
 
 /* Get the owner kind for the connection */
-static inline ConnOwnerKind connGetOwnerKind(connection *conn) {
+static inline ConnectionOwnerKind connGetOwnerKind(connection *conn) {
     return conn->owner_kind;
 }
 
