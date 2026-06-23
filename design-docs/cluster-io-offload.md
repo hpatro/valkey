@@ -9,7 +9,7 @@ Jobs flow through:
 - `io_shared_inbox` (SPMC): main thread -> I/O workers
 - `io_shared_outbox` (MPSC): I/O workers -> main thread
 
-If the pool is inactive or enqueue fails, the caller falls back to synchronous
+If the pool is inactive or enqueue fails, the caller falls back to non-blocking
 I/O on the main thread and increments `stat_cluster_io_sync_fallbacks`.
 
 ## Architecture
@@ -111,7 +111,7 @@ Important note:
   but the worker stops at `io_last_send_block`, so those new nodes are picked up
   by a later dispatch.
 
-If dispatch returns `C_ERR`, `clusterWriteHandler(conn)` falls back to the synchronous `connWrite()` loop.
+If dispatch returns `C_ERR`, `clusterWriteHandler(conn)` falls back to the non-blocking `connWrite()` loop on the main thread.
 
 ## Data Flow: Accept Path (TLS)
 
