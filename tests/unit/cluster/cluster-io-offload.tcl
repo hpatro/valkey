@@ -34,7 +34,7 @@ start_cluster 3 0 {tags {external:skip cluster} overrides {io-threads 4 io-threa
         }
     }
 
-    test "disabling io threads on one node causes sync fallback" {
+    test "disabling io threads on one node falls back to main-thread I/O" {
         set old_threads [lindex [R 0 config get io-threads] 1]
         R 0 config set io-threads 1
         R 0 config resetstat

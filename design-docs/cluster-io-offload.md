@@ -209,7 +209,7 @@ same pattern:
 
 Return values:
 - `C_OK`: work was offloaded, or an equivalent job is already pending.
-- `C_ERR`: pool inactive or enqueue failed, so caller may sync-fallback.
+- `C_ERR`: pool inactive or enqueue failed, so caller may fall back to handling the I/O on the main thread.
 
 ## Deferred Teardown
 
@@ -245,7 +245,7 @@ loads it with acquire ordering.
 | `CLUSTER_IO_READ_ERROR` / `CLUSTER_IO_EOF` | Log debug, drain queued `rcvbuf` snapshot, then free link |
 | `CLUSTER_IO_WRITE_ERROR` | Log debug, free link |
 | `CONN_STATE_ACCEPTING` after accept completion | Leave connection open; TLS event flow will retry |
-| Pool inactive / queue full | Sync fallback + increment `stat_cluster_io_main_thread_fallbacks` |
+| Pool inactive / queue full | Run the I/O on the main thread + increment `stat_cluster_io_main_thread_fallbacks` |
 
 ## Follow-Up
 

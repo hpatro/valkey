@@ -1923,10 +1923,10 @@ struct valkeyServer {
     double stat_module_progress;                        /* Module save progress. */
     size_t stat_clients_type_memory[CLIENT_TYPE_COUNT]; /* Mem usage by type */
     size_t stat_cluster_links_memory;                   /* Mem usage by cluster links */
-    long long stat_cluster_threaded_reads_processed;             /* Cluster reads offloaded to I/O threads */
-    long long stat_cluster_threaded_writes_processed;            /* Cluster writes offloaded to I/O threads */
-    long long stat_cluster_threaded_accepts_processed;           /* Cluster accepts offloaded to I/O threads */
-    long long stat_cluster_io_main_thread_fallbacks;           /* Cluster I/O ops that fell back to sync */
+    long long stat_cluster_threaded_reads_processed;             /* Cluster reads handled by I/O threads */
+    long long stat_cluster_threaded_writes_processed;            /* Cluster writes handled by I/O threads */
+    long long stat_cluster_threaded_accepts_processed;           /* Cluster accepts handled by I/O threads */
+    long long stat_cluster_io_main_thread_fallbacks;           /* Cluster I/O ops handled on the main thread because dispatch failed */
     long long stat_cluster_async_closed_links;          /* Cluster links deferred-freed via async_close */
     long long stat_cluster_queued_inbound_packets;      /* Complete cluster packets awaiting main-thread application */
     long long
