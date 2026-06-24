@@ -9621,7 +9621,7 @@ void VM_RegisterClusterMessageReceiver(ValkeyModuleCtx *ctx,
                 if (prev)
                     prev->next = r->next;
                 else
-                    clusterReceivers[type]->next = r->next;
+                    clusterReceivers[type] = r->next;
                 zfree(r);
             }
             return;
@@ -12718,6 +12718,8 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
         return VALKEYMODULE_OK;
     }
 
+    if (callback == NULL) return VALKEYMODULE_OK;
+
     /* No event found, we need to add a new one. */
     el = zmalloc(sizeof(*el));
     el->module = ctx->module;
@@ -12877,11 +12879,19 @@ void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
     ValkeyModuleEventListener *el;
     listIter li;
     listNode *ln;
-    listRewind(ValkeyModule_EventListeners, &li);
 
+    listRewind(ValkeyModule_EventListeners, &li);
     while ((ln = listNext(&li))) {
         el = ln->value;
         if (el->module == module) {
+            if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+                commandResultSuccessListeners--;
+            else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+                commandResultFailureListeners--;
+            else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
+                commandResultRejectedListeners--;
+            else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_ACL_REJECTED)
+                commandResultACLRejectedListeners--;
             listDelNode(ValkeyModule_EventListeners, ln);
             zfree(el);
         }
@@ -14611,7 +14621,7 @@ size_t moduleCount(void) {
  * servers's maxmemory policy is LFU based. Value is idle time in milliseconds.
  * returns VALKEYMODULE_OK if the LRU was updated, VALKEYMODULE_ERR otherwise. */
 int VM_SetLRU(ValkeyModuleKey *key, mstime_t lru_idle) {
-    if (!key->value) return VALKEYMODULE_ERR;
+    if (!key || !key->value) return VALKEYMODULE_ERR;
     if (objectSetLRUOrLFU(key->value, -1, lru_idle * 1000)) return VALKEYMODULE_OK;
     return VALKEYMODULE_ERR;
 }
@@ -14622,7 +14632,7 @@ int VM_SetLRU(ValkeyModuleKey *key, mstime_t lru_idle) {
  * returns VALKEYMODULE_OK if when key is valid. */
 int VM_GetLRU(ValkeyModuleKey *key, mstime_t *lru_idle) {
     *lru_idle = -1;
-    if (!key->value) return VALKEYMODULE_ERR;
+    if (!key || !key->value) return VALKEYMODULE_ERR;
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) return VALKEYMODULE_OK;
     *lru_idle = objectGetLRUIdleSecs(key->value) * 1000;
     return VALKEYMODULE_OK;
@@ -14634,7 +14644,7 @@ int VM_GetLRU(ValkeyModuleKey *key, mstime_t *lru_idle) {
  * the access frequency (must be <= 255).
  * returns VALKEYMODULE_OK if the LFU was updated, VALKEYMODULE_ERR otherwise. */
 int VM_SetLFU(ValkeyModuleKey *key, long long lfu_freq) {
-    if (!key->value) return VALKEYMODULE_ERR;
+    if (!key || !key->value) return VALKEYMODULE_ERR;
     if (objectSetLRUOrLFU(key->value, lfu_freq, -1)) return VALKEYMODULE_OK;
     return VALKEYMODULE_ERR;
 }
@@ -14644,7 +14654,7 @@ int VM_SetLFU(ValkeyModuleKey *key, long long lfu_freq) {
  * returns VALKEYMODULE_OK if when key is valid. */
 int VM_GetLFU(ValkeyModuleKey *key, long long *lfu_freq) {
     *lfu_freq = -1;
-    if (!key->value) return VALKEYMODULE_ERR;
+    if (!key || !key->value) return VALKEYMODULE_ERR;
     if (lrulfu_isUsingLFU()) *lfu_freq = objectGetLFUFrequency(key->value);
     return VALKEYMODULE_OK;
 }

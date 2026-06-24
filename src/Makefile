@@ -581,7 +581,7 @@ ENGINE_SERVER_OBJ = \
     ziplist.o \
     zipmap.o \
     zmalloc.o \
-	queues.o
+    queues.o
 ENGINE_SERVER_OBJ+=$(ENGINE_TRACE_OBJ)
 ENGINE_CLI_NAME=$(ENGINE_NAME)-cli$(PROG_SUFFIX)
 ENGINE_CLI_OBJ = \
@@ -631,6 +631,7 @@ ENGINE_BENCHMARK_OBJ = \
     strl.o \
     util.o \
     valkey-benchmark.o \
+    valkey-benchmark-dataset.o \
     valkey_strtod.o \
     zmalloc.o
 ENGINE_CHECK_RDB_NAME=$(ENGINE_NAME)-check-rdb$(PROG_SUFFIX)
