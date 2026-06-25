@@ -228,7 +228,8 @@ Counters live in `CLUSTER INFO`:
 `cluster_io_queued_inbound_packets`.
 
 Code: `src/cluster_legacy.c` (`clusterReadJob`, `clusterWriteJob`,
-`clusterAcceptJob`, `clusterHandle*Completion`, `freeClusterLink`).
+`clusterAcceptJob`, `clusterHandleReadCompletion`, `clusterHandleWriteCompletion`,
+`clusterHandleAcceptCompletion`, `freeClusterLink`).
 
 ## Relevant Code
 
