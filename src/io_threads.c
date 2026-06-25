@@ -5,8 +5,15 @@
  */
 
 #include "io_threads.h"
+#include "cluster.h"
+#include "cluster_legacy.h"
+#include "connhelpers.h"
 #include "queues.h"
 #include <sys/resource.h>
+
+#define IO_MPSC_QUEUE_SIZE 16384
+#define IO_SPMC_QUEUE_SIZE 4096
+#define IO_SPSC_QUEUE_SIZE 4096
 
 static _Thread_local int thread_id = 0;
 static _Thread_local mpscTicket io_thread_ticket = {0};
@@ -22,7 +29,8 @@ static mpscQueue io_shared_outbox = {0};
 // Main -> IO (Thread-Specific) for tasks that must run on specific IO thread where IO threads check their private inbox before the shared queue
 static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
 static size_t io_jobs_submitted;
-static atomic_size_t io_jobs_finished;
+static _Atomic(size_t) io_jobs_finished;
+static size_t cluster_io_pending_responses;
 static int io_threads_initialized = 0;
 _Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
 
@@ -44,8 +52,8 @@ static inline void untagJob(void *tagged_ptr, void **ptr, int *type) {
 /* Handler prototypes */
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
-void IOThreadFreeArgv(robj **argv);
-void IOThreadPoll(aeEventLoop *el);
+void ioThreadFreeArgv(robj **argv);
+void ioThreadPoll(aeEventLoop *el);
 static void ioThreadAccept(client *c);
 
 int inMainThread(void) {
@@ -68,8 +76,8 @@ static size_t getPendingIOThreadsJobs(void) {
 }
 
 /* Read/write jobs awaiting response from IO threads. */
-static int getPendingIOResponsesCount(void) {
-    return server.stat_io_writes_pending + server.stat_io_reads_pending;
+static size_t getPendingIOResponsesCount(void) {
+    return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -107,9 +115,6 @@ void waitForClientIO(client *c) {
 }
 
 void IOThreadsBeforeSleep(long long current_time) {
-#ifndef RUSAGE_THREAD
-    UNUSED(current_time);
-#endif
     if (server.io_threads_num == 1) return;
     serverAssert(inMainThread());
 
@@ -126,29 +131,24 @@ void IOThreadsBeforeSleep(long long current_time) {
         }
     }
 
-#ifdef RUSAGE_THREAD
-    /* If threads are not active track main thread CPU time for ignition decision */
+    /* If threads are not active, track main-thread active time for ignition decision */
     if (server.active_io_threads_num == 1) {
         static long long last_measurement_time = 0;
         if (current_time - last_measurement_time < 50000) return; /* Sample once in 50ms */
         last_measurement_time = current_time;
-        struct rusage ru;
-        if (getrusage(RUSAGE_THREAD, &ru) == 0) {
-            long long sys_time_us = ru.ru_stime.tv_sec * 1000000LL + ru.ru_stime.tv_usec;
-            long long user_time_us = ru.ru_utime.tv_sec * 1000000LL + ru.ru_utime.tv_usec;
-            trackInstantaneousMetric(STATS_METRIC_MAIN_THREAD_CPU_SYS, sys_time_us, current_time, 1000000);
-            trackInstantaneousMetric(STATS_METRIC_MAIN_THREAD_CPU_USER, user_time_us, current_time, 1000000);
-        }
+        trackInstantaneousMetric(STATS_METRIC_MAIN_THREAD_ACTIVE_TIME, server.stat_active_time, current_time, 1000000);
     }
-#endif
 }
 
 #define IO_COOLDOWN_MS 1000
 #define IO_SAMPLE_RATE_MS 10
 #define IO_IGNITION_EVENTS 4
-#define IO_IGNITION_CPU_SYS 30.0
-#define IO_IGNITION_CPU_SYS_LOW 5.0
-#define IO_IGNITION_CPU_USER 50.0
+/* Start using I/O threads when the main thread is active for more than the below
+ * defined percentage of the time. This number is picked somewhat arbitrarily but
+ * needed to be low enough to make sure we start the next thread quickly while not
+ * starting too many threads unnecessarily to avoid contention. */
+#define IO_IGNITION_MAIN_THREAD_ACTIVE_PERCENT 30
+#define BATCH_SIZE 32
 
 void IOThreadsAfterSleep(int numevents) {
     if (server.io_threads_num == 1) return;
@@ -170,15 +170,9 @@ void IOThreadsAfterSleep(int numevents) {
     /* Ignition Policy */
     if (server.active_io_threads_num == 1) {
         int should_ignite = 0;
-#ifdef RUSAGE_THREAD
-        float cpu_sys = (float)getInstantaneousMetric(STATS_METRIC_MAIN_THREAD_CPU_SYS) / 10000.0;
-        float cpu_user = (float)getInstantaneousMetric(STATS_METRIC_MAIN_THREAD_CPU_USER) / 10000.0;
-        /* Ignite IO threads if sys CPU > 30%, or if sys CPU > 5% and user CPU > 50% */
-        should_ignite = (cpu_sys > IO_IGNITION_CPU_SYS) ||
-                        (cpu_sys > IO_IGNITION_CPU_SYS_LOW && cpu_user > IO_IGNITION_CPU_USER);
-#else
-        should_ignite = (numevents >= IO_IGNITION_EVENTS);
-#endif
+        float main_thread_active_time = (float)getInstantaneousMetric(STATS_METRIC_MAIN_THREAD_ACTIVE_TIME) / 10000.0;
+        /* Ignite IO threads when main-thread active time exceeds the threshold (30%) */
+        should_ignite = (main_thread_active_time > (float)IO_IGNITION_MAIN_THREAD_ACTIVE_PERCENT);
         if (should_ignite) {
             pthread_mutex_unlock(&io_threads_mutex[1]);
             server.active_io_threads_num++;
@@ -242,7 +236,7 @@ void IOThreadsAfterSleep(int numevents) {
 
 /* This function performs polling on the given event loop and updates the server's
  * IO fired events count and poll state. */
-void IOThreadPoll(aeEventLoop *el) {
+void ioThreadPoll(aeEventLoop *el) {
     struct timeval tvp = {0, 0};
     int num_events = aePoll(el, &tvp);
     server.io_ae_fired_events = num_events;
@@ -301,7 +295,6 @@ static void *IOThreadMain(void *myid) {
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
-    const int BATCH_SIZE = 32;
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
@@ -313,8 +306,8 @@ static void *IOThreadMain(void *myid) {
         work_start_time = getMonotonicUs();
         if (processed != 0) {
             atomic_fetch_add_explicit(&used_active_time_io_thread[id],
-                                        work_start_time - prev_work_start_time,
-                                        memory_order_relaxed);
+                                      work_start_time - prev_work_start_time,
+                                      memory_order_relaxed);
         }
         processed = 0;
         /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
@@ -325,11 +318,11 @@ static void *IOThreadMain(void *myid) {
                 untagJob(batch_jobs[i], &data, &type);
 
                 switch (type) {
-                case JOB_REQ_FREE_ARGV:
-                    IOThreadFreeArgv((robj **)data);
+                case JOB_SPSC_FREE_ARGV:
+                    ioThreadFreeArgv((robj **)data);
                     break;
-                case JOB_REQ_POLL:
-                    IOThreadPoll((aeEventLoop *)data);
+                case JOB_SPSC_POLL:
+                    ioThreadPoll((aeEventLoop *)data);
                     break;
                 default:
                     serverPanic("Invalid SPSC job type: %d", type);
@@ -338,10 +331,8 @@ static void *IOThreadMain(void *myid) {
             processed += batch_count;
         }
 
-        /*
-         * PRIORITY 2: Shared Global Queue (SPMC)
-         * Only checked after SPSC is drained.
-         */
+        /* PRIORITY 2: Shared Global Queue (SPMC)
+         * Only checked after SPSC is drained. */
         void *tagged_job = spmcDequeue(&io_shared_inbox);
         if (tagged_job) {
             void *data;
@@ -356,13 +347,22 @@ static void *IOThreadMain(void *myid) {
                 ioThreadWriteToClient((client *)data);
                 break;
             case JOB_REQ_FREE_OBJ:
-                sdsfreeVoid(data);
+                decrRefCount(data);
                 break;
             case JOB_REQ_ACCEPT:
                 ioThreadAccept((client *)data);
                 break;
             case JOB_REQ_POLL:
-                IOThreadPoll((aeEventLoop *)data);
+                ioThreadPoll((aeEventLoop *)data);
+                break;
+            case JOB_REQ_CLUSTER_READ:
+                clusterReadJob((clusterLink *)data);
+                break;
+            case JOB_REQ_CLUSTER_WRITE:
+                clusterWriteJob((clusterLink *)data);
+                break;
+            case JOB_REQ_CLUSTER_ACCEPT:
+                clusterAcceptJob((connection *)data);
                 break;
             default:
                 serverPanic("Invalid SPMC job type: %d", type);
@@ -377,7 +377,6 @@ static void *IOThreadMain(void *myid) {
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
             if (unlikely(pending_io_responses)) {
-                //ak-todo: check if flushing needs to be included
                 flushPendingIOResponses(0);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
@@ -399,7 +398,7 @@ static void createIOThread(int id) {
     serverAssert(id > 0 && id < server.io_threads_num);
 
     /* Initialize the private SPSC queue for this thread */
-    spscInit(&io_private_inbox[id]);
+    spscInit(&io_private_inbox[id], IO_SPSC_QUEUE_SIZE);
 
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
@@ -459,7 +458,7 @@ int updateIOThreads(const char **err) {
      * in that state, we will deadlock (Main thread waits for worker, Worker waits for queue space). */
     size_t pending = getPendingIOResponsesCount();
 
-    if (pending > MPSC_QUEUE_SIZE) {
+    if (pending > io_shared_outbox.queue_size) {
         if (err) *err = "Can't update IO threads under load, try again later";
         return 0;
     }
@@ -498,10 +497,11 @@ void initIOThreads(int prev_threads_num) {
         server.active_io_threads_num = 1; /* We start with threads not active. */
         server.io_poll_state = AE_IO_STATE_NONE;
         server.io_ae_fired_events = 0;
-        spmcInit(&io_shared_inbox);
-        mpscInit(&io_shared_outbox);
+        spmcInit(&io_shared_inbox, IO_SPMC_QUEUE_SIZE);
+        mpscInit(&io_shared_outbox, IO_MPSC_QUEUE_SIZE);
         io_jobs_submitted = 0;
         atomic_init(&io_jobs_finished, 0);
+        cluster_io_pending_responses = 0;
         prefetchCommandsBatchInit();
         io_threads_initialized = 1;
     }
@@ -510,6 +510,34 @@ void initIOThreads(int prev_threads_num) {
     for (int i = prev_threads_num; i < server.io_threads_num; i++) {
         createIOThread(i);
     }
+}
+
+void testOnlyInitIOThreadQueues(void) {
+    if (io_shared_inbox.buffer) spmcFree(&io_shared_inbox);
+    if (io_shared_outbox.buffer) mpscFree(&io_shared_outbox);
+    if (pending_io_responses) {
+        listRelease(pending_io_responses);
+        pending_io_responses = NULL;
+    }
+    spmcInit(&io_shared_inbox, IO_SPMC_QUEUE_SIZE);
+    mpscInit(&io_shared_outbox, IO_MPSC_QUEUE_SIZE);
+    io_jobs_submitted = 0;
+    atomic_store_explicit(&io_jobs_finished, 0, memory_order_relaxed);
+    cluster_io_pending_responses = 0;
+    io_thread_ticket = (mpscTicket){0};
+}
+
+void testOnlyFreeIOThreadQueues(void) {
+    if (pending_io_responses) {
+        listRelease(pending_io_responses);
+        pending_io_responses = NULL;
+    }
+    spmcFree(&io_shared_inbox);
+    mpscFree(&io_shared_outbox);
+    io_jobs_submitted = 0;
+    atomic_store_explicit(&io_jobs_finished, 0, memory_order_relaxed);
+    cluster_io_pending_responses = 0;
+    io_thread_ticket = (mpscTicket){0};
 }
 
 int trySendReadToIOThreads(client *c) {
@@ -561,6 +589,7 @@ int trySendWriteToIOThreads(client *c) {
     if (c->flag.lua_debug) return C_ERR;
 
     int is_replica = getClientType(c) == CLIENT_TYPE_REPLICA;
+    clientReplyBlock *block = NULL;
     if (is_replica) {
         c->io_last_reply_block = listLast(server.repl_buffer_blocks);
         replBufBlock *o = listNodeValue(c->io_last_reply_block);
@@ -572,14 +601,10 @@ int trySendWriteToIOThreads(client *c) {
          * threads from reading data that might be invalid in their local CPU cache. */
         c->io_last_reply_block = listLast(c->reply);
         if (c->io_last_reply_block) {
-            clientReplyBlock *block = (clientReplyBlock *)listNodeValue(c->io_last_reply_block);
+            block = (clientReplyBlock *)listNodeValue(c->io_last_reply_block);
             c->io_last_bufpos = block->used;
-            /* If buffer is encoded force new header */
-            if (block->flag.buf_encoded) block->last_header = NULL;
         } else {
             c->io_last_bufpos = (size_t)c->bufpos;
-            /* If buffer is encoded force new header */
-            if (c->flag.buf_encoded) c->last_header = NULL;
         }
     }
 
@@ -598,7 +623,15 @@ int trySendWriteToIOThreads(client *c) {
         c->io_last_bufpos = 0;
         return C_ERR;
     }
-
+    /* Force new header after successful enqueue so the main thread doesn't
+     * extend a header the I/O thread is currently reading. */
+    if (!is_replica) {
+        if (block) {
+            if (block->flag.buf_encoded) block->last_header = NULL;
+        } else {
+            if (c->flag.buf_encoded) c->last_header = NULL;
+        }
+    }
     if (c->flag.pending_write) {
         listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         c->flag.pending_write = 0;
@@ -609,8 +642,154 @@ int trySendWriteToIOThreads(client *c) {
     return C_OK;
 }
 
+/* Try to offload a cluster link read to an I/O thread.
+ * Enqueues a tagged job onto io_shared_inbox (SPMC queue).
+ * Returns C_OK if offloaded or if a job is already pending (to prevent
+ *   the caller from falling back to synchronous I/O on a connection
+ *   with an in-flight worker job).
+ * Returns C_ERR if fallback is needed (pool inactive or spmcEnqueue fails). */
+int trySendClusterReadToIOThreads(struct clusterLink *link) {
+    /* If any I/O job is already in flight for this link, return C_OK
+     * so the caller does NOT fall back to synchronous I/O. */
+    if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+    if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+
+    /* Invariant: io_refs must be 0 when both states are IDLE. */
+    serverAssert(link->io_refs == 0);
+
+    /* clusterReadHandler() drains any queued packet snapshot before
+     * attempting a new dispatch. */
+    serverAssert(link->io_rcvbuf_snapshot_len == 0);
+    serverAssert(link->io_rcvbuf_snapshot_packets == 0);
+
+    /* No I/O thread pool available — synchronous fallback. */
+    if (server.active_io_threads_num <= 1) {
+        server.stat_cluster_io_main_thread_fallbacks++;
+        return C_ERR;
+    }
+
+    /* Postpone connection state updates while the I/O thread operates. */
+    connSetPostponeUpdateState(link->conn, 1);
+    connIncrRefs(link->conn);
+
+    /* Transition link to pending-read state. */
+    link->io_read_state = CLUSTER_LINK_IO_PENDING;
+    link->io_refs++;
+    link->rcvbuf_alloc_at_dispatch = link->rcvbuf_alloc;
+
+    /* Enqueue the read job. */
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_CLUSTER_READ)) == false)) {
+        /* Rollback on enqueue failure. */
+        link->io_read_state = CLUSTER_LINK_IO_IDLE;
+        link->io_refs--;
+        connDecrRefs(link->conn);
+        connSetPostponeUpdateState(link->conn, 0);
+        server.stat_cluster_io_main_thread_fallbacks++;
+        return C_ERR;
+    }
+
+    io_jobs_submitted++;
+    cluster_io_pending_responses++;
+    server.stat_cluster_threaded_reads_processed++;
+    return C_OK;
+}
+
+/* Try to offload a cluster link write to an I/O thread.
+ * Enqueues a tagged job onto io_shared_inbox after snapshotting the current
+ * head offset and the last queue node visible to the worker. New messages
+ * appended by clusterSendMessage during the write stay queued on the main
+ * thread and are picked up by a later dispatch.
+ * Returns C_OK if offloaded or if a job is already pending (to prevent
+ *   the caller from falling back to synchronous I/O on a connection
+ *   with an in-flight worker job).
+ * Returns C_ERR if fallback is needed (pool inactive or spmcEnqueue fails). */
+int trySendClusterWriteToIOThreads(struct clusterLink *link) {
+    listNode *last_send_block;
+
+    /* If any I/O job is already in flight for this link, return C_OK
+     * so the caller does NOT fall back to synchronous I/O. */
+    if (link->io_write_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+    if (link->io_read_state != CLUSTER_LINK_IO_IDLE) return C_OK;
+
+    /* Invariant: io_refs must be 0 when both states are IDLE. */
+    serverAssert(link->io_refs == 0);
+
+    /* Nothing to write. */
+    if (listLength(link->send_msg_queue) == 0) return C_OK;
+
+    /* No I/O thread pool available — synchronous fallback. */
+    if (server.active_io_threads_num <= 1) {
+        server.stat_cluster_io_main_thread_fallbacks++;
+        return C_ERR;
+    }
+
+    last_send_block = listLast(link->send_msg_queue);
+    serverAssert(last_send_block != NULL);
+
+    /* Postpone connection state updates while the I/O thread operates. */
+    connSetPostponeUpdateState(link->conn, 1);
+    connIncrRefs(link->conn);
+
+    /* Snapshot the canonical queue for one write job. */
+    link->io_last_send_block = last_send_block;
+    link->io_head_offset = link->head_msg_send_offset;
+    link->io_nodes_sent = 0;
+
+    /* Transition link to pending-write state. */
+    link->io_write_state = CLUSTER_LINK_IO_PENDING;
+    link->io_refs++;
+
+    /* Enqueue the write job. */
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(link, JOB_REQ_CLUSTER_WRITE)) == false)) {
+        link->io_write_state = CLUSTER_LINK_IO_IDLE;
+        link->io_refs--;
+        link->io_last_send_block = NULL;
+        link->io_head_offset = 0;
+        link->io_nodes_sent = 0;
+        connDecrRefs(link->conn);
+        connSetPostponeUpdateState(link->conn, 0);
+        server.stat_cluster_io_main_thread_fallbacks++;
+        return C_ERR;
+    }
+
+    io_jobs_submitted++;
+    cluster_io_pending_responses++;
+    server.stat_cluster_threaded_writes_processed++;
+    return C_OK;
+}
+
+/* Try to offload a cluster TLS accept to an I/O thread.
+ * Called from clusterAcceptHandler BEFORE any clusterLink exists.
+ * Returns C_OK if offloaded, C_ERR if fallback is needed. */
+int trySendClusterAcceptToIOThreads(connection *conn) {
+    if (!(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD)) return C_ERR;
+    /* A cluster accept job is already in flight for this connection. */
+    if (conn->flags & CONN_FLAG_ACCEPT_OFFLOAD_PENDING) return C_OK;
+    if (server.active_io_threads_num <= 1) {
+        server.stat_cluster_io_main_thread_fallbacks++;
+        return C_ERR;
+    }
+
+    conn->flags |= CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
+    connSetPostponeUpdateState(conn, 1);
+    connIncrRefs(conn);
+
+    if (unlikely(spmcEnqueue(&io_shared_inbox, tagJob(conn, JOB_REQ_CLUSTER_ACCEPT)) == false)) {
+        connDecrRefs(conn);
+        connSetPostponeUpdateState(conn, 0);
+        conn->flags &= ~CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
+        server.stat_cluster_io_main_thread_fallbacks++;
+        return C_ERR;
+    }
+
+    io_jobs_submitted++;
+    cluster_io_pending_responses++;
+    server.stat_cluster_threaded_accepts_processed++;
+    return C_OK;
+}
+
 /* Internal function to free the client's argv in an IO thread. */
-void IOThreadFreeArgv(robj **argv) {
+void ioThreadFreeArgv(robj **argv) {
     int last_arg = 0;
     for (int i = 0;; i++) {
         robj *o = argv[i];
@@ -674,7 +853,7 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
      * this is the last argument to free. With this approach, we don't need to
      * send the argc to the IO thread and we can send just the argv ptr. */
     argv[last_arg_to_free]->refcount = 0;
-    void *job = tagJob(argv, JOB_REQ_FREE_ARGV);
+    void *job = tagJob(argv, JOB_SPSC_FREE_ARGV);
     /* We pass false to enqueue the job without committing the queue index immediately.
      * This allows us to batch multiple free jobs together and
      * commit them in a single operation later in the event loop. This reduces the overhead
@@ -698,10 +877,8 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
 
-    void *job = tagJob(objectGetVal(obj), JOB_REQ_FREE_OBJ);
+    void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
     if (unlikely(spmcEnqueue(&io_shared_inbox, job) == false)) return C_ERR;
-    objectSetVal(obj, NULL);
-    decrRefCount(obj);
     io_jobs_submitted++;
     server.stat_io_freed_objects++;
     return C_OK;
@@ -810,7 +987,14 @@ int trySendAcceptToIOThreads(connection *conn) {
         return C_ERR;
     }
 
+    /* Cluster TLS accepts have no client private-data yet. Route them to the
+     * dedicated cluster accept offload path. */
+    if (connGetOwnerKind(conn) == CONN_OWNER_CLUSTER_LINK) {
+        return trySendClusterAcceptToIOThreads(conn);
+    }
+
     client *c = connGetPrivateData(conn);
+    serverAssert(c != NULL);
     if (c->io_read_state != CLIENT_IDLE) {
         return C_OK;
     }
@@ -851,8 +1035,6 @@ static void handleReadJobs(client **read_jobs, int read_count) {
     if (read_count) {
         server.stat_io_reads_processed += read_count;
         processClientsCommandsBatch();
-        /* Any responses that failed to enqueue to IO threads need to be handled now */
-        handleClientsWithPendingWrites();
     }
 }
 
@@ -901,13 +1083,26 @@ int processIOThreadsResponses(void) {
                 void *data;
                 int job_type;
                 untagJob(jobs[i], &data, &job_type);
-                client *c = (client *)data;
                 if (job_type == JOB_RES_READ_CLIENT) {
+                    client *c = (client *)data;
                     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
                     read_jobs[read_count++] = c;
                 } else if (job_type == JOB_RES_WRITE_CLIENT) {
+                    client *c = (client *)data;
                     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                     write_jobs[write_count++] = c;
+                } else if (job_type == JOB_RES_CLUSTER_READ) {
+                    serverAssert(cluster_io_pending_responses > 0);
+                    cluster_io_pending_responses--;
+                    clusterHandleReadCompletion((struct clusterLink *)data);
+                } else if (job_type == JOB_RES_CLUSTER_WRITE) {
+                    serverAssert(cluster_io_pending_responses > 0);
+                    cluster_io_pending_responses--;
+                    clusterHandleWriteCompletion((struct clusterLink *)data);
+                } else if (job_type == JOB_RES_CLUSTER_ACCEPT) {
+                    serverAssert(cluster_io_pending_responses > 0);
+                    cluster_io_pending_responses--;
+                    clusterHandleAcceptCompletion((connection *)data);
                 } else {
                     serverPanic("Unknown job type %d", job_type);
                 }

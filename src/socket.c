@@ -156,8 +156,11 @@ static void connSocketClose(connection *conn) {
 }
 
 static int connSocketWrite(connection *conn, const void *data, size_t data_len) {
-    /* Assert the main thread is not writing to a connection that is currently offloaded. */
-    debugServerAssert(!(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD) || !inMainThread() ||
+    /* Assert the main thread is not writing to a connection that is currently offloaded.
+     * Only applies to client-owned connections; cluster-link-owned connections use
+     * separate dispatch functions and do not carry client io_write_state. */
+    debugServerAssert(connGetOwnerKind(conn) != CONN_OWNER_CLIENT ||
+                      !(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD) || !inMainThread() ||
                       ((client *)connGetPrivateData(conn))->io_write_state != CLIENT_PENDING_IO);
 
     int ret = write(conn->fd, data, data_len);
@@ -188,8 +191,11 @@ static int connSocketWritev(connection *conn, const struct iovec *iov, int iovcn
 }
 
 static int connSocketRead(connection *conn, void *buf, size_t buf_len) {
-    /* Assert the main thread is not reading from a connection that is currently offloaded. */
-    debugServerAssert(!(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD) || !inMainThread() ||
+    /* Assert the main thread is not reading from a connection that is currently offloaded.
+     * Only applies to client-owned connections; cluster-link-owned connections use
+     * separate dispatch functions and do not carry client io_read_state. */
+    debugServerAssert(connGetOwnerKind(conn) != CONN_OWNER_CLIENT ||
+                      !(conn->flags & CONN_FLAG_ALLOW_ACCEPT_OFFLOAD) || !inMainThread() ||
                       ((client *)connGetPrivateData(conn))->io_read_state != CLIENT_PENDING_IO);
 
 
@@ -374,13 +380,14 @@ static int connSocketBlockingConnect(connection *conn, const char *addr, int por
         return C_ERR;
     }
 
+    conn->fd = fd;
+
     if ((aeWait(fd, AE_WRITABLE, timeout) & AE_WRITABLE) == 0) {
         conn->state = CONN_STATE_ERROR;
         conn->last_errno = ETIMEDOUT;
         return C_ERR;
     }
 
-    conn->fd = fd;
     conn->state = CONN_STATE_CONNECTED;
     return C_OK;
 }
@@ -390,15 +397,27 @@ static int connSocketBlockingConnect(connection *conn, const char *addr, int por
  */
 
 static ssize_t connSocketSyncWrite(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    return syncWrite(conn->fd, ptr, size, timeout);
+    ssize_t ret = syncWrite(conn->fd, ptr, size, timeout);
+    if (ret == -1) {
+        conn->last_errno = errno;
+    }
+    return ret;
 }
 
 static ssize_t connSocketSyncRead(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    return syncRead(conn->fd, ptr, size, timeout);
+    ssize_t ret = syncRead(conn->fd, ptr, size, timeout);
+    if (ret == -1) {
+        conn->last_errno = errno;
+    }
+    return ret;
 }
 
 static ssize_t connSocketSyncReadLine(connection *conn, char *ptr, ssize_t size, long long timeout) {
-    return syncReadLine(conn->fd, ptr, size, timeout);
+    ssize_t ret = syncReadLine(conn->fd, ptr, size, timeout);
+    if (ret == -1) {
+        conn->last_errno = errno;
+    }
+    return ret;
 }
 
 static int connSocketGetType(void) {
