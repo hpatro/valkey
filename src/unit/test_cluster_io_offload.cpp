@@ -12,6 +12,7 @@
 extern "C" {
 #include "cluster.h"
 #include "cluster_legacy.h"
+#include "connhelpers.h"
 #include "io_threads.h"
 #include "server.h"
 
