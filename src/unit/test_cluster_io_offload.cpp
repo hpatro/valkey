@@ -288,7 +288,7 @@ TEST_F(ClusterIOOffloadTest, ReadCompletionOnReadErrorDrainsThenCloses) {
     EXPECT_EQ(server.cluster->stats_bus_messages_received[CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK], 1LL);
 }
 
-TEST_F(ClusterIOOffloadTest, ReadCompletionOnProtocolErrorClosesImmediately) {
+TEST_F(ClusterIOOffloadTest, ReadCompletionOnProtocolErrorDrainsThenCloses) {
     clusterLink *link = makeLink();
     FakeConn *fc = (FakeConn *)link->conn;
     ASSERT_EQ(trySendClusterReadToIOThreads(link), C_OK);
@@ -299,7 +299,7 @@ TEST_F(ClusterIOOffloadTest, ReadCompletionOnProtocolErrorClosesImmediately) {
     releaseLinkOwnership(link);
 
     EXPECT_GE(fc->close_calls, 1);
-    EXPECT_EQ(server.cluster->stats_bus_messages_received[CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK], 0LL);
+    EXPECT_EQ(server.cluster->stats_bus_messages_received[CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK], 1LL);
 }
 
 TEST_F(ClusterIOOffloadTest, BufferLimitCountsAtomicRcvbufLen) {
@@ -424,7 +424,7 @@ TEST_F(ClusterIOOffloadTest, AcceptCompletionAcceptingKeepsConnectionOpen) {
 }
 
 TEST_F(ClusterIOOffloadTest, AcceptCompletionConnectedCreatesLink) {
-    FakeConn *fc = makeConn(CONN_OWNER_CLIENT);
+    FakeConn *fc = makeConn(CONN_OWNER_CLUSTER_LINK);
     fc->conn.flags |= CONN_FLAG_ACCEPT_OFFLOAD_PENDING;
     fc->conn.state = CONN_STATE_CONNECTED;
     fc->conn.refs = 1;
