@@ -308,17 +308,20 @@ start_server {tags {"commandlog"} overrides {commandlog-execution-slower-than 10
     } {} {needs:debug}
 
     test {COMMANDLOG slow - EXEC records total transaction time when inner commands are individually fast} {
-        r config set commandlog-execution-slower-than 100000
+        r config set commandlog-execution-slower-than 500000
         r commandlog reset slow
         r multi
-        for {set i 0} {$i < 10} {incr i} {
+        for {set i 0} {$i < 20} {incr i} {
             r debug sleep 0.03
         }
         r exec
-        assert_equal [r commandlog len slow] 1
-        set e [lindex [r commandlog get -1 slow] 0]
+        set entries [r commandlog get -1 slow]
+        # EXEC is logged after the commands it executes, so it is the newest entry.
+        set e [lindex $entries 0]
         assert_equal [lindex $e 3] {exec}
-        assert {[lindex $e 2] >= 100000}
+        assert {[lindex $e 2] >= 500000}
+        # No inner command should have been logged on its own.
+        assert_equal {} [lrange $entries 1 end]
     } {} {needs:debug}
 
     test {COMMANDLOG slow - EXEC is not logged when transaction is below threshold} {

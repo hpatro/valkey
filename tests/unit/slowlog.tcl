@@ -186,17 +186,20 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
     } {} {needs:debug}
 
     test {SLOWLOG - EXEC records total transaction time when inner commands are individually fast} {
-        r config set slowlog-log-slower-than 100000
+        r config set slowlog-log-slower-than 500000
         r slowlog reset
         r multi
-        for {set i 0} {$i < 10} {incr i} {
+        for {set i 0} {$i < 20} {incr i} {
             r debug sleep 0.03
         }
         r exec
-        assert_equal [r slowlog len] 1
-        set e [lindex [r slowlog get] 0]
+        set entries [r slowlog get -1]
+        # EXEC is logged after the commands it executes, so it is the newest entry.
+        set e [lindex $entries 0]
         assert_equal [lindex $e 3] {exec}
-        assert {[lindex $e 2] >= 100000}
+        assert {[lindex $e 2] >= 500000}
+        # No inner command should have been logged on its own.
+        assert_equal {} [lrange $entries 1 end]
     } {} {needs:debug}
 
     test {SLOWLOG - EXEC is not logged when transaction is below threshold} {
